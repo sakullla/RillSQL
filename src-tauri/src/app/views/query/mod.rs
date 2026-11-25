@@ -1526,6 +1526,10 @@ impl QueryPane {
         let ids: Vec<String> = tabs.iter().map(|tab| tab.id.clone()).collect();
         for tab in tabs {
             self.desk.import_tab(&tab.id, &tab.draft, target_of(tab));
+            // 查询页自己刚选的库还没回到外壳时不覆盖；其余情况外壳是目标的唯一来源。
+            if !self.targets.iter().any(|pending| pending.id == tab.id) {
+                self.desk.follow_target(&tab.id, target_of(tab));
+            }
             self.tab_connections.insert(tab.id.clone(), tab.connection_id.clone().unwrap_or_default());
             if !self.links.contains_key(&tab.id) {
                 self.links.insert(

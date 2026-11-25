@@ -10614,6 +10614,39 @@ fn blank_query_inherits_the_obvious_target() {
     assert_eq!(model.active_tab().unwrap().connection_id, None);
 }
 
+/// 首页点一条还没连上的连接：查询标签立即绑定这条连接与它自己的默认库，
+/// 连上后不再重放“在此新建查询”去读对象树上另一条连接的焦点行。
+#[test]
+fn new_query_on_an_unconnected_connection_binds_that_connection_not_the_tree_focus() {
+    use crate::app::views::connections::LinkStatus;
+    let (mut model, orders) = pg_orders_model();
+    model.connections.rows.push(pg_saved("pg", "dev"));
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    let mut other = pg_saved("uat", "test");
+    other.saved.database = Some("crm".into());
+    model.connections.rows.push(other);
+    // 对象树的焦点停在另一条连接的表上。
+    model.nav.set_focus(&orders);
+    model.connections.selected = Some("uat".into());
+    model.dispatch("conn-new-query").unwrap();
+    let tab = model.active_tab().cloned().unwrap();
+    assert_eq!(tab.connection_id.as_deref(), Some("uat"));
+    assert_eq!(tab.database.as_deref(), Some("crm"), "用这条连接自己的默认库");
+    // 连上之后只剩“建立连接”，不会再开一个绑定别的库的查询。
+    model.connections.status.insert("uat".into(), LinkStatus::Connected);
+    let ready = model.take_ready_intents();
+    assert!(ready.iter().all(|intent| intent.action == super::conn_modal::ConnectAction::ConnectOnly), "{ready:?}");
+    assert_eq!(model.tabs.len(), 1);
+
+    // 连接行上的“在此新建查询”：行本身没有库，用连接的默认库而不是空库。
+    let root = crate::catalog::hierarchy::connection_node_id("pg");
+    assert!(model.open_nav_menu(&root));
+    let _ = model.dispatch("tree-new-query");
+    let tab = model.active_tab().cloned().unwrap();
+    assert_eq!(tab.connection_id.as_deref(), Some("pg"));
+    assert_eq!(tab.database.as_deref(), Some("shop"));
+}
+
 #[test]
 fn new_query_keeps_the_redis_target_with_other_connections_open() {
     let mut model = WorkbenchModel::new(Shell::default());

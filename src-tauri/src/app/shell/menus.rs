@@ -717,6 +717,23 @@ pub fn overview_menu_items(name: &str, object: bool, relational: bool) -> Vec<Me
     items
 }
 
+/// 关系图里的表还没读进对象树时的表级菜单：打开数据、查看结构、复制名称。
+pub fn diagram_fallback_items(name: &str) -> Vec<MenuItem> {
+    vec![
+        with_icon(targeted("diagram-open-data", "catalog.tree.openData", format!("diagram-open-data:{name}")), IconName::Table),
+        with_icon(targeted("diagram-open-structure", "catalog.tree.viewStructure", format!("diagram-open-structure:{name}")), IconName::TableProperties),
+        sep(with_icon(targeted("diagram-copy-name", "catalog.tree.copyFullName", format!("diagram-copy-name:{name}")), IconName::Copy)),
+    ]
+}
+
+/// 关系图自己的表级动作：高亮关联、展开/折叠列。放在菜单末尾，前面加分隔线。
+pub fn diagram_extra_items(name: &str) -> Vec<MenuItem> {
+    vec![
+        sep(with_icon(targeted("diagram-focus", "diagram.menu.related", format!("diagram-focus:{name}")), IconName::LocateFixed)),
+        with_icon(targeted("diagram-expand", "diagram.menu.toggleColumns", format!("diagram-expand:{name}")), IconName::ListCollapse),
+    ]
+}
+
 /// 只读行列表（库概览、历史）的复制条目：与 `ui::read_table` 的右键菜单同一组方式与文案。
 /// 命令为 `{prefix}:{kind}`，由各列表按当前多选与右键所在的列生成文本。第一项前加分隔线。
 pub fn row_copy_items(prefix: &str) -> Vec<MenuItem> {

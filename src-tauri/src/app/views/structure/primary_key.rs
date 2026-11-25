@@ -5,6 +5,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, div, px,
@@ -207,11 +208,23 @@ impl StructurePane {
                     .items_center()
                     .gap(px(Space::SM))
                     .child(kit::icon(IconName::Key, 13., p.warn))
-                    .child(div().flex_none().text_size(px(TypeScale::SM)).font_weight(FontWeight::SEMIBOLD).child(t("structure.field.primary")))
+                    .child(
+                        div()
+                            .id("structure-pk-title")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(Space::XXS))
+                            .text_size(px(TypeScale::SM))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            // NOT NULL 的说明放进悬停提示：只有改主键时才写成一行。
+                            .when(!order.is_empty(), |this| this.tooltip_text(t("structure.pk.notNullNote")))
+                            .child(t("structure.field.primary")),
+                    )
                     .child(div().flex_1().min_w_0().child(chips))
                     .children(add_menu),
             );
-        if !order.is_empty() {
+        if !order.is_empty() && (self.primary_key_changed() || self.session.mode == StructureMode::Create) {
             strip = strip.child(kit::muted(t("structure.pk.notNullNote"), p));
         }
         if self.primary_key_changed() {

@@ -7,11 +7,11 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::{
-    canvas, AppContext as _, ClickEvent, Context, Focusable as _, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, PathBuilder,
+    canvas, AppContext as _, Context, Focusable as _, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, PathBuilder,
     Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
-use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
+use crate::ui::kit::{self, Palette, Radius, Space, Tip as _, TypeScale};
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
 use crate::application::AppServices;
@@ -41,6 +41,16 @@ struct DragPan {
     moved: bool,
 }
 
+/// 拖动一张卡片：按下时的指针与卡片原偏移；没拖动就当作一次单击（选中）。
+struct CardDrag {
+    table: String,
+    x: f32,
+    y: f32,
+    dx: f32,
+    dy: f32,
+    moved: bool,
+}
+
 pub struct DiagramPane {
     services: Arc<AppServices>,
     locale: Locale,
@@ -52,22 +62,39 @@ pub struct DiagramPane {
     error: String,
     loading: bool,
     hovered: Option<String>,
+    /// 单击选中的卡片：关联表与连线保持高亮，直到点画布空白或 Esc。
+    selected: Option<String>,
     token: Option<TaskToken>,
     applied: String,
     zoom: f32,
     pan_x: f32,
     pan_y: f32,
     search: String,
+    /// 搜索命中的全部表（按卡片顺序）；highlight 是其中当前那一个。
+    matches: Vec<String>,
+    match_index: usize,
     highlight: Option<String>,
     center_pending: bool,
+    /// 下一帧要居中的表（菜单“定位”）。
+    center_target: Option<String>,
     navigation: Option<DiagramOpen>,
     /// 打开请求被外壳取走之后，文字清单仍保留这一行，测试和悬停清单能看到。
     open_note: Option<String>,
-    card_menu: Option<String>,
+    /// 右键/菜单键请求的表级菜单：外壳取走后用对象树同一册菜单弹在指针处。
+    menu_request: Option<(String, Option<gpui_kit::Point<gpui_kit::Pixels>>)>,
     back: bool,
     drag: Option<DragPan>,
+    card_drag: Option<CardDrag>,
+    /// 用户拖过的卡片相对自动布局的偏移（未缩放坐标）。
+    offsets: std::collections::HashMap<String, (f32, f32)>,
+    /// 展开显示全部列的长表。
+    expanded: std::collections::HashSet<String>,
     content_w: f32,
     content_h: f32,
+    content_x0: f32,
+    content_y0: f32,
+    /// 画板在窗口里的位置与大小：滚轮按指针缩放、适应视口都按它算。
+    board: std::rc::Rc<std::cell::Cell<gpui_kit::Bounds<gpui_kit::Pixels>>>,
     search_input: Option<EntityInput>,
 }
 
@@ -90,21 +117,31 @@ impl DiagramPane {
             error: String::new(),
             loading: false,
             hovered: None,
+            selected: None,
             token: None,
             applied: String::new(),
             zoom: 1.,
             pan_x: 0.,
             pan_y: 0.,
             search: String::new(),
+            matches: Vec::new(),
+            match_index: 0,
             highlight: None,
             center_pending: false,
+            center_target: None,
             navigation: None,
             open_note: None,
-            card_menu: None,
+            menu_request: None,
             back: false,
             drag: None,
+            card_drag: None,
+            offsets: std::collections::HashMap::new(),
+            expanded: std::collections::HashSet::new(),
             content_w: 0.,
             content_h: 0.,
+            content_x0: 0.,
+            content_y0: 0.,
+            board: std::rc::Rc::new(std::cell::Cell::new(gpui_kit::Bounds::default())),
             search_input: None,
         }
     }
@@ -117,6 +154,26 @@ impl DiagramPane {
 
     pub fn take_open(&mut self) -> Option<DiagramOpen> {
         self.navigation.take()
+    }
+
+    /// 外壳取走一次表级菜单请求：目标表（连接/库/模式/表名）与指针位置（键盘打开时为空）。
+    pub fn take_menu(&mut self) -> Option<(DiagramOpen, Option<gpui_kit::Point<gpui_kit::Pixels>>)> {
+        let (table, at) = self.menu_request.take()?;
+        Some((
+            DiagramOpen {
+                connection_id: self.connection_id.clone(),
+                database: self.database.clone(),
+                schema: self.schema.clone(),
+                table,
+                structure: false,
+            },
+            at,
+        ))
+    }
+
+    /// 复制用的限定名：有模式时带上模式。
+    fn qualified(&self, table: &str) -> String {
+        if self.schema.is_empty() { table.to_owned() } else { format!("{}.{table}", self.schema) }
     }
 
     pub fn set_locale(&mut self, locale: Locale) {
@@ -160,23 +217,47 @@ impl DiagramPane {
         } else if id == "diagram-back" {
             self.back = true;
         } else if id == "diagram-zoom-in" {
-            self.zoom = clamp_zoom(self.zoom + 0.1);
+            self.zoom_around_center(self.zoom + 0.1);
         } else if id == "diagram-zoom-out" {
-            self.zoom = clamp_zoom(self.zoom - 0.1);
+            self.zoom_around_center(self.zoom - 0.1);
         } else if id == "diagram-zoom-reset" {
             self.zoom = 1.;
             self.pan_x = 0.;
             self.pan_y = 0.;
+        } else if id == "diagram-layout-reset" {
+            self.offsets.clear();
+            self.expanded.clear();
         } else if id == "diagram-search-clear" {
             self.clear_search();
-        } else if id == "diagram-menu-close" {
-            self.card_menu = None;
+        } else if id == "diagram-search-next" {
+            self.step_match(1);
+        } else if id == "diagram-search-prev" {
+            self.step_match(-1);
+        } else if id == "diagram-menu-close" || id == "diagram-deselect" {
+            self.selected = None;
+            self.menu_request = None;
         } else if let Some(name) = id.strip_prefix("diagram-open-data:") {
             self.request_open(name, false);
         } else if let Some(name) = id.strip_prefix("diagram-open-structure:") {
             self.request_open(name, true);
         } else if let Some(name) = id.strip_prefix("diagram-menu:") {
-            self.card_menu = Some(name.to_owned());
+            self.open_card_menu(name, None);
+        } else if let Some(name) = id.strip_prefix("diagram-select:") {
+            self.select(name);
+        } else if let Some(name) = id.strip_prefix("diagram-focus:") {
+            // 菜单里的“定位并高亮关联表”：选中（不切换）并把它移到视野中央。
+            if self.knows(name) {
+                self.selected = Some(name.to_owned());
+                self.center_target = Some(name.to_owned());
+            }
+        } else if let Some(name) = id.strip_prefix("diagram-expand:") {
+            if !self.expanded.remove(name) {
+                self.expanded.insert(name.to_owned());
+            }
+        } else if let Some(name) = id.strip_prefix("diagram-copy-name:") {
+            if self.knows(name) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(self.qualified(name)));
+            }
         }
         cx.notify();
     }
@@ -187,11 +268,65 @@ impl DiagramPane {
         self.pan_x = 0.;
         self.pan_y = 0.;
         self.search.clear();
+        self.matches.clear();
+        self.match_index = 0;
         self.highlight = None;
         self.center_pending = false;
         self.navigation = None;
-        self.card_menu = None;
+        self.menu_request = None;
+        self.selected = None;
         self.drag = None;
+        self.card_drag = None;
+        self.offsets.clear();
+        self.expanded.clear();
+    }
+
+    fn knows(&self, table: &str) -> bool {
+        self.diagram.as_ref().is_some_and(|diagram| diagram.tables.iter().any(|item| item.name == table))
+    }
+
+    /// 选中一张卡片（再点一次取消）：关联表与连线保持高亮。
+    fn select(&mut self, table: &str) {
+        if !self.knows(table) {
+            return;
+        }
+        if self.selected.as_deref() == Some(table) {
+            self.selected = None;
+        } else {
+            self.selected = Some(table.to_owned());
+        }
+    }
+
+    /// 以画板中心为锚点缩放：按钮与键盘缩放时视野中央的卡片不跑开。
+    fn zoom_around_center(&mut self, zoom: f32) {
+        let board = self.board.get();
+        let w = board.size.width.as_f32();
+        let h = board.size.height.as_f32();
+        if w <= 1. || h <= 1. {
+            self.zoom = clamp_zoom(zoom);
+            return;
+        }
+        self.zoom_at(zoom, w / 2., h / 2.);
+    }
+
+    /// 以画板内一点为锚点缩放（滚轮缩放按指针位置）。
+    fn zoom_at(&mut self, zoom: f32, x: f32, y: f32) {
+        let next = clamp_zoom(zoom);
+        let ratio = next / self.zoom.max(0.01);
+        self.pan_x = x - (x - self.pan_x) * ratio;
+        self.pan_y = y - (y - self.pan_y) * ratio;
+        self.zoom = next;
+    }
+
+    /// 搜索命中之间前后跳转（Enter / Shift+Enter），并把当前那张居中。
+    fn step_match(&mut self, step: i32) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let len = self.matches.len() as i32;
+        self.match_index = ((self.match_index as i32 + step).rem_euclid(len)) as usize;
+        self.highlight = self.matches.get(self.match_index).cloned();
+        self.center_pending = self.highlight.is_some();
     }
 
     fn clear_target(&mut self) {
@@ -207,11 +342,10 @@ impl DiagramPane {
 
     /// 记下要打开的表。不连接数据库，也不发送 SQL。
     pub fn request_open(&mut self, table: &str, structure: bool) {
-        let known = self.diagram.as_ref().is_some_and(|diagram| diagram.tables.iter().any(|item| item.name == table));
-        if !known {
+        if !self.knows(table) {
             return;
         }
-        self.card_menu = None;
+        self.menu_request = None;
         self.navigation = Some(DiagramOpen {
             connection_id: self.connection_id.clone(),
             database: self.database.clone(),
@@ -225,15 +359,33 @@ impl DiagramPane {
 
     fn focus_search(&mut self, query: String) {
         self.search = query;
-        let needle = self.search.trim().to_ascii_lowercase();
+        let needle = self.search.trim().to_lowercase();
+        self.match_index = 0;
         if needle.is_empty() {
+            self.matches.clear();
             self.highlight = None;
             self.center_pending = false;
             return;
         }
-        self.highlight = self.diagram.as_ref().and_then(|diagram| {
-            diagram.tables.iter().find(|table| table.name.to_ascii_lowercase().contains(&needle)).map(|table| table.name.clone())
-        });
+        // 全名相等的表排在最前，其次是前缀匹配，最后是包含：搜完整表名时直接落到那张表。
+        let mut matches: Vec<(u8, String)> = self
+            .diagram
+            .as_ref()
+            .map(|diagram| {
+                diagram
+                    .tables
+                    .iter()
+                    .filter_map(|table| {
+                        let name = table.name.to_lowercase();
+                        let rank = if name == needle { 0 } else if name.starts_with(&needle) { 1 } else if name.contains(&needle) { 2 } else { return None };
+                        Some((rank, table.name.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        matches.sort_by_key(|(rank, _)| *rank);
+        self.matches = matches.into_iter().map(|(_, name)| name).collect();
+        self.highlight = self.matches.first().cloned();
         self.center_pending = self.highlight.is_some();
     }
 
@@ -244,15 +396,60 @@ impl DiagramPane {
             self.pan_y = 0.;
             return;
         }
-        let zx = (viewport_w - 24.).max(80.) / self.content_w;
-        let zy = (viewport_h - 24.).max(80.) / self.content_h;
+        // 画板已经画过一次就按画板大小算（不含页头、侧栏），否则退回窗口大小。
+        let board = self.board.get();
+        let (w, h) = if board.size.width.as_f32() > 1. { (board.size.width.as_f32(), board.size.height.as_f32()) } else { (viewport_w, viewport_h) };
+        let zx = (w - 24.).max(80.) / self.content_w;
+        let zy = (h - 24.).max(80.) / self.content_h;
         self.zoom = clamp_zoom(zx.min(zy));
-        self.pan_x = 12.;
-        self.pan_y = 12.;
+        // 内容放不满的那一边居中。
+        self.pan_x = ((w - self.content_w * self.zoom) / 2.).max(0.) - self.content_x0 * self.zoom;
+        self.pan_y = ((h - self.content_h * self.zoom) / 2.).clamp(0., 12.) - self.content_y0 * self.zoom;
     }
 
     fn begin_drag(&mut self, x: f32, y: f32) {
         self.drag = Some(DragPan { x, y, pan_x: self.pan_x, pan_y: self.pan_y, moved: false });
+    }
+
+    fn begin_card_drag(&mut self, table: &str, x: f32, y: f32) {
+        let (dx, dy) = self.offsets.get(table).copied().unwrap_or((0., 0.));
+        self.card_drag = Some(CardDrag { table: table.to_owned(), x, y, dx, dy, moved: false });
+    }
+
+    /// 拖动中的指针移动：卡片拖动优先，否则平移画布。返回是否改了画面。
+    fn pointer_move(&mut self, x: f32, y: f32) -> bool {
+        if let Some(drag) = self.card_drag.as_mut() {
+            let dx = x - drag.x;
+            let dy = y - drag.y;
+            if !drag.moved && dx.abs() < 3. && dy.abs() < 3. {
+                return false;
+            }
+            drag.moved = true;
+            let zoom = self.zoom.max(0.01);
+            let offset = (drag.dx + dx / zoom, drag.dy + dy / zoom);
+            let table = drag.table.clone();
+            self.offsets.insert(table, offset);
+            return true;
+        }
+        if self.drag.is_some() {
+            self.move_drag(x, y);
+            return true;
+        }
+        false
+    }
+
+    /// 松开指针：没拖动的卡片按下算一次单击（选中/取消），没拖动的画布按下清掉选中。
+    fn pointer_up(&mut self) {
+        if let Some(drag) = self.card_drag.take() {
+            if !drag.moved {
+                self.select(&drag.table);
+            }
+        } else if let Some(drag) = self.drag.as_ref() {
+            if !drag.moved {
+                self.selected = None;
+            }
+        }
+        self.drag = None;
     }
 
     fn move_drag(&mut self, x: f32, y: f32) {
@@ -356,22 +553,28 @@ impl DiagramPane {
                 self.request_open(table, shift);
                 true
             }
-            "contextmenu" | "menu" => self.open_card_menu(table),
-            "f10" if shift => self.open_card_menu(table),
+            "contextmenu" | "menu" => self.open_card_menu(table, None),
+            "f10" if shift => self.open_card_menu(table, None),
+            " " | "space" => {
+                self.select(table);
+                true
+            }
             "escape" => {
                 self.hovered = None;
-                self.card_menu.take().is_some()
+                self.menu_request = None;
+                self.selected.take().is_some()
             }
             _ => false,
         }
     }
 
-    fn open_card_menu(&mut self, table: &str) -> bool {
-        let known = self.diagram.as_ref().is_some_and(|diagram| diagram.tables.iter().any(|item| item.name == table));
-        if !known {
+    /// 右键/菜单键：选中这张卡片并请外壳弹出表级菜单。
+    fn open_card_menu(&mut self, table: &str, at: Option<gpui_kit::Point<gpui_kit::Pixels>>) -> bool {
+        if !self.knows(table) {
             return false;
         }
-        self.card_menu = Some(table.to_owned());
+        self.selected = Some(table.to_owned());
+        self.menu_request = Some((table.to_owned(), at));
         true
     }
 
@@ -379,16 +582,17 @@ impl DiagramPane {
     fn pane_key(&mut self, key: &str) -> bool {
         match key {
             "escape" => {
-                let menu = self.card_menu.take().is_some();
+                let menu = self.menu_request.take().is_some();
+                let selected = self.selected.take().is_some();
                 let hover = self.hovered.take().is_some();
-                menu || hover
+                menu || selected || hover
             }
             "=" | "+" => {
-                self.zoom = clamp_zoom(self.zoom + 0.1);
+                self.zoom_around_center(self.zoom + 0.1);
                 true
             }
             "-" => {
-                self.zoom = clamp_zoom(self.zoom - 0.1);
+                self.zoom_around_center(self.zoom - 0.1);
                 true
             }
             "0" => {
@@ -406,6 +610,8 @@ impl DiagramPane {
     /// 两者都变成空串，写回就不会发生，控件里留着旧文字（清除按钮和框内 Esc 都会失效）。
     fn clear_search(&mut self) {
         self.search.clear();
+        self.matches.clear();
+        self.match_index = 0;
         self.highlight = None;
         self.center_pending = false;
     }
@@ -456,8 +662,11 @@ impl DiagramPane {
         if let Some(note) = &self.open_note {
             lines.push(note.clone());
         }
-        if let Some(name) = &self.card_menu {
+        if let Some((name, _)) = &self.menu_request {
             lines.push(format!("menu {name}"));
+        }
+        if let Some(name) = &self.selected {
+            lines.push(format!("selected {name}"));
         }
         if !self.search.trim().is_empty() {
             match &self.highlight {
@@ -469,9 +678,10 @@ impl DiagramPane {
             let kind = if open.structure { "open-structure" } else { "open-data" };
             lines.push(format!("{kind} {}", open.table));
         }
+        let focus = self.hovered.as_deref().or(self.selected.as_deref());
         for (index, column) in columns.iter().enumerate() {
             for table in column {
-                let mark = hover_mark(self.hovered.as_deref(), &table.name, diagram);
+                let mark = hover_mark(focus, &table.name, diagram);
                 lines.push(format!("column {index} {mark} {}", table.name));
                 for column in &table.columns {
                     let fk = if foreign.contains(&(table.name.as_str(), column.name.as_str())) { "fk" } else { "column" };
@@ -492,7 +702,7 @@ impl DiagramPane {
             lines.push(i18n::text(self.locale, "diagram.foreignKeys"));
         }
         for edge in &diagram.edges {
-            let mark = if edge_hot(self.hovered.as_deref(), edge) { "hot-wire" } else if self.hovered.is_some() { "dim-wire" } else { "wire" };
+            let mark = if edge_hot(focus, edge) { "hot-wire" } else if focus.is_some() { "dim-wire" } else { "wire" };
             lines.push(format!(
                 "{mark} arrow {}.{} -> {}.{}",
                 edge.from_table,
@@ -605,6 +815,89 @@ fn linked(hovered: &str, name: &str, diagram: &Diagram) -> bool {
 
 fn edge_hot(hovered: Option<&str>, edge: &DiagramEdge) -> bool {
     hovered.is_some_and(|name| name == edge.from_table || name == edge.to_table)
+}
+
+/// 长表只显示主键、外键与前几列，其余折叠成一行“+N 列”。返回要画的列下标（原顺序）与折叠数。
+fn visible_columns(table: &DiagramTable, foreign: &std::collections::HashSet<(&str, &str)>, expanded: bool) -> (Vec<usize>, usize) {
+    let total = table.columns.len();
+    if expanded || total <= COLLAPSE_AT {
+        return ((0..total).collect(), 0);
+    }
+    let mut keep: Vec<usize> = (0..total)
+        .filter(|&index| {
+            let column = &table.columns[index];
+            column.primary || foreign.contains(&(table.name.as_str(), column.name.as_str()))
+        })
+        .collect();
+    for index in 0..total {
+        if keep.len() >= SHOW_ROWS {
+            break;
+        }
+        if !keep.contains(&index) {
+            keep.push(index);
+        }
+    }
+    keep.sort_unstable();
+    let hidden = total - keep.len();
+    (keep, hidden)
+}
+
+/// 卡片高度（未缩放）：表头 + 显示的列 + 折叠行 + 范围外外键说明。
+fn card_height_for(table: &DiagramTable, shown: usize, folded: bool) -> f32 {
+    HEAD_H + ROW_H * shown.max(1) as f32 + 10. + ROW_H * table.outside.len() as f32 + if folded { ROW_H } else { 0. }
+}
+
+/// 自动布局（未缩放坐标）。有外键关系的表按引用层级从左到右分列（被引用的在左），
+/// 一列太高就换到旁边一列；没有任何关系的表放在右侧，按瀑布流铺成接近横向屏幕比例的一片，
+/// 而不是把几百张表竖着排成一条。
+fn auto_layout(tables: &[DiagramTable], edges: &[DiagramEdge], heights: &std::collections::HashMap<String, f32>) -> std::collections::HashMap<String, (f32, f32)> {
+    let known: Vec<&str> = tables.iter().map(|table| table.name.as_str()).collect();
+    let mut related: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for edge in edges {
+        if edge.from_table != edge.to_table && known.contains(&edge.from_table.as_str()) && known.contains(&edge.to_table.as_str()) {
+            related.insert(edge.from_table.as_str());
+            related.insert(edge.to_table.as_str());
+        }
+    }
+    let height = |name: &str| heights.get(name).copied().unwrap_or(HEAD_H + ROW_H);
+    let mut places = std::collections::HashMap::new();
+    let mut levels: Vec<Vec<&DiagramTable>> = Vec::new();
+    for table in tables.iter().filter(|table| related.contains(table.name.as_str())) {
+        let level = depth(&table.name, &known, edges, &mut Vec::new());
+        while levels.len() <= level {
+            levels.push(Vec::new());
+        }
+        levels[level].push(table);
+    }
+    let mut x = PAD;
+    for level in levels.iter().filter(|level| !level.is_empty()) {
+        let mut y = PAD;
+        for (index, table) in level.iter().enumerate() {
+            let h = height(&table.name);
+            if index > 0 && y + h > PAD + MAX_STACK_H {
+                x += CARD_W + GAP_Y * 2.;
+                y = PAD;
+            }
+            places.insert(table.name.clone(), (x, y));
+            y += h + GAP_Y;
+        }
+        x += CARD_W + GAP_X;
+    }
+    let isolated: Vec<&DiagramTable> = tables.iter().filter(|table| !related.contains(table.name.as_str())).collect();
+    if !isolated.is_empty() {
+        let step = CARD_W + GRID_GAP;
+        let total: f32 = isolated.iter().map(|table| height(&table.name) + GRID_GAP).sum();
+        // 列数使整片宽高比接近 16:10：cols * step ≈ 1.6 * total / cols。
+        let cols = ((1.6 * total / step).sqrt().ceil() as usize).clamp(1, isolated.len().min(12));
+        let x0 = if places.is_empty() { PAD } else { x };
+        let mut columns = vec![PAD; cols];
+        for table in isolated {
+            let (slot, top) = columns.iter().copied().enumerate().fold((0, f32::MAX), |best, (index, top)| if top < best.1 { (index, top) } else { best });
+            places.insert(table.name.clone(), (x0 + slot as f32 * step, top));
+            columns[slot] = top + height(&table.name) + GRID_GAP;
+        }
+    }
+    places
 }
 
 #[cfg(test)]
@@ -886,11 +1179,17 @@ mod tests {
         assert!(pane.card_key("orders", "enter", true), "Shift+Enter 由卡片处理");
         assert!(pane.take_open().expect("Shift+Enter = 看结构").structure);
         assert!(pane.card_key("orders", "contextmenu", false), "菜单键 = 右键菜单");
-        assert_eq!(pane.card_menu.as_deref(), Some("orders"));
-        assert!(pane.card_key("orders", "escape", false), "Esc 收起菜单");
-        assert!(pane.card_menu.is_none());
+        assert_eq!(pane.menu_request.as_ref().map(|(name, _)| name.as_str()), Some("orders"));
+        assert_eq!(pane.selected.as_deref(), Some("orders"), "打开菜单的卡片同时被选中");
+        assert!(pane.card_key("orders", "escape", false), "Esc 收起菜单与选中");
+        assert!(pane.menu_request.is_none() && pane.selected.is_none());
         assert!(pane.card_key("orders", "f10", true), "Shift+F10 = 右键菜单");
-        assert_eq!(pane.card_menu.as_deref(), Some("orders"));
+        let (target, at) = pane.take_menu().expect("外壳取走表级菜单请求");
+        assert_eq!((target.connection_id.as_str(), target.database.as_str(), target.table.as_str()), ("notes", "shop", "orders"));
+        assert!(at.is_none(), "键盘打开的菜单没有指针位置");
+        assert!(pane.take_menu().is_none(), "菜单请求只取一次");
+        assert!(pane.card_key("customers", " ", false), "空格选中卡片");
+        assert_eq!(pane.selected.as_deref(), Some("customers"));
         assert!(!pane.card_key("orders", "f10", false), "单独 F10 不抢系统菜单");
         assert!(pane.card_key("missing", "enter", false));
         assert!(pane.take_open().is_none(), "不存在的表不能变成打开请求");
@@ -918,10 +1217,10 @@ mod tests {
         pane.pan_y = 24.;
         assert!(pane.pane_key("0"));
         assert_eq!((pane.pan_x, pane.pan_y, pane.zoom), (0., 0., 1.));
-        pane.card_menu = Some("orders".into());
+        pane.selected = Some("orders".into());
         pane.hovered = Some("orders".into());
         assert!(pane.pane_key("escape"));
-        assert!(pane.card_menu.is_none() && pane.hovered.is_none());
+        assert!(pane.selected.is_none() && pane.hovered.is_none());
         assert!(!pane.pane_key("x"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1176,50 +1475,98 @@ mod tests {
         diagram_holds_at(cx, 640.);
     }
 
-    /// 卡片菜单不只能用 Esc 或再点卡片关掉：点页面其它位置也要收起，
-    /// 而菜单条里的按钮不能被这条“点别处收起”抢先拆掉。
+    /// 单击选中卡片、点画布空白取消；右键请求表级菜单（外壳弹出）；拖卡片只移动它、不算单击。
     #[gpui_kit::test]
-    fn clicking_outside_the_card_menu_dismisses_it(cx: &mut TestAppContext) {
+    fn card_clicks_select_drag_and_request_the_table_menu(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (window, pane) = open_diagram_window(cx, 1360.);
         cx.update(|cx| fill_state(&pane, "cards", cx));
-        let open_menu = |cx: &mut TestAppContext| {
-            cx.update(|cx| {
-                pane.update(cx, |pane, cx| {
-                    pane.card_menu = Some("orders".into());
-                    cx.notify();
-                })
-            });
-        };
-
-        open_menu(cx);
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.try_find("diagram-card-menu").is_some(), "卡片菜单要先摆出来");
-            // 菜单条里的按钮照常可用：这里要证明按下事件在菜单条上停住，不会被“点别处收起”抢走。
-            window.click("diagram-open-data:orders", cx);
+            window.click("diagram-card:orders", cx);
             window.render_frame(cx);
         })
         .unwrap();
-        assert!(cx.update(|cx| pane.read(cx).navigation.is_some()), "菜单里的“打开数据”要照常发出打开请求");
-
-        cx.update(|cx| {
-            pane.update(cx, |pane, cx| {
-                pane.navigation = None;
-                cx.notify();
-            })
-        });
-        open_menu(cx);
+        assert_eq!(cx.update(|cx| pane.read(cx).selected.clone()).as_deref(), Some("orders"), "单击选中卡片");
+        let text = cx.update(|cx| pane.read(cx).lines().join("\n"));
+        assert!(text.contains("hot orders") && text.contains("linked customers") && text.contains("hot-wire"), "选中后关联保持高亮：{text}");
         cx.update_window(window, |_, window, cx| {
-            window.render_frame(cx);
-            assert!(window.try_find("diagram-card-menu").is_some(), "第二次摆出菜单");
-            // 画布空白处：既不在卡片上，也不在菜单条上，点下去菜单要收起。
             window.click_at("diagram-board", gpui_kit::point(px(6.), px(6.)), cx);
             window.render_frame(cx);
-            assert!(window.try_find("diagram-card-menu").is_none(), "点画布空白要收起卡片菜单");
         })
         .unwrap();
-        assert!(cx.update(|cx| pane.read(cx).card_menu.is_none()), "收起时菜单状态要一起清掉");
+        assert!(cx.update(|cx| pane.read(cx).selected.is_none()), "点画布空白取消选中");
+
+        cx.update_window(window, |_, window, cx| {
+            window.right_click("diagram-card:customers", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let request = cx.update(|cx| pane.update(cx, |pane, _| pane.take_menu()));
+        let (target, at) = request.expect("右键要请求表级菜单");
+        assert_eq!(target.table, "customers");
+        assert!(at.is_some(), "右键菜单弹在指针处");
+        assert_eq!(cx.update(|cx| pane.read(cx).selected.clone()).as_deref(), Some("customers"));
+
+        // 拖动卡片：只记偏移，不切换选中；重排布局清掉偏移。
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                pane.selected = None;
+                pane.begin_card_drag("orders", 100., 100.);
+                assert!(pane.pointer_move(160., 130.));
+                pane.pointer_up();
+                assert_eq!(pane.offsets.get("orders").copied(), Some((60., 30.)));
+                assert!(pane.selected.is_none(), "拖动不是单击");
+                pane.zoom = 2.;
+                pane.begin_card_drag("orders", 0., 0.);
+                assert!(pane.pointer_move(20., 0.));
+                pane.pointer_up();
+                assert_eq!(pane.offsets.get("orders").copied(), Some((70., 30.)), "偏移按缩放换算回画布坐标");
+            });
+        });
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.command("diagram-layout-reset", cx)));
+        assert!(cx.update(|cx| pane.read(cx).offsets.is_empty()));
+
+        // 滚轮平移画布，不缩放。
+        let before = cx.update(|cx| (pane.read(cx).pan_y, pane.read(cx).zoom));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.scroll("diagram-board", ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-50.))), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let after = cx.update(|cx| (pane.read(cx).pan_y, pane.read(cx).zoom));
+        assert!((after.0 - (before.0 - 50.)).abs() < 0.5, "滚轮平移：{before:?} -> {after:?}");
+        assert_eq!(after.1, before.1, "不按修饰键滚动不缩放");
+    }
+
+    /// 没有外键关系的表铺成多列，而不是一条竖排；长表折叠到键列与前几列。
+    #[test]
+    fn isolated_tables_spread_into_a_grid_and_long_tables_fold() {
+        let tables: Vec<DiagramTable> = (0..30)
+            .map(|index| DiagramTable {
+                name: format!("t{index:02}"),
+                columns: (0..20)
+                    .map(|column| crate::diagram::DiagramColumn { name: format!("c{column}"), type_name: "int".into(), primary: column == 18 })
+                    .collect(),
+                outside: Vec::new(),
+            })
+            .collect();
+        let foreign = std::collections::HashSet::new();
+        let (rows, hidden) = visible_columns(&tables[0], &foreign, false);
+        assert_eq!(rows.len(), SHOW_ROWS);
+        assert!(rows.contains(&18), "主键列不能被折叠掉");
+        assert_eq!(hidden, 20 - SHOW_ROWS);
+        let (rows, hidden) = visible_columns(&tables[0], &foreign, true);
+        assert_eq!((rows.len(), hidden), (20, 0), "展开后显示全部列");
+        let heights: std::collections::HashMap<String, f32> = tables.iter().map(|table| (table.name.clone(), 300.)).collect();
+        let places = auto_layout(&tables, &[], &heights);
+        assert_eq!(places.len(), 30);
+        let xs: std::collections::BTreeSet<i32> = places.values().map(|(x, _)| *x as i32).collect();
+        assert!(xs.len() >= 4, "30 张无关系的表至少铺成 4 列：{xs:?}");
+        let max_y = places.values().map(|(_, y)| *y).fold(0f32, f32::max);
+        let max_x = places.values().map(|(x, _)| *x).fold(0f32, f32::max);
+        assert!(max_x + CARD_W >= max_y * 0.8, "整体接近横向比例：宽 {max_x} 高 {max_y}");
     }
 
     fn pump(
@@ -1247,16 +1594,18 @@ mod tests {
     }
 }
 
-const CARD_W: f32 = 220.;
-const GAP_X: f32 = 90.;
+const CARD_W: f32 = 240.;
+const GAP_X: f32 = 96.;
 const GAP_Y: f32 = 24.;
+const GRID_GAP: f32 = 28.;
 const HEAD_H: f32 = 34.;
 const ROW_H: f32 = 22.;
+/// 超过这么多列的表默认折叠；折叠后至少显示这么多行（键列一定在内）。
+const COLLAPSE_AT: usize = 16;
+const SHOW_ROWS: usize = 12;
+/// 有关系的一层表堆到这么高就换列。
+const MAX_STACK_H: f32 = 1400.;
 const PAD: f32 = 32.;
-
-fn card_height(table: &DiagramTable) -> f32 {
-    HEAD_H + ROW_H * table.columns.len().max(1) as f32 + 10. + if table.outside.is_empty() { 0. } else { ROW_H }
-}
 
 fn paint_arrow(end: gpui_kit::Point<gpui_kit::Pixels>, toward: gpui_kit::Point<gpui_kit::Pixels>, color: gpui_kit::Hsla, window: &mut Window) {
     let dx = (end.x - toward.x).as_f32();
@@ -1287,13 +1636,21 @@ impl DiagramPane {
             let initial = self.search.clone();
             let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(initial.clone()));
             let subscription = cx.subscribe(&state, |this, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let text = input.read(cx).value().to_string();
-                    if let Some(field) = this.search_input.as_mut() {
-                        field.sync = text.clone();
+                match event {
+                    InputEvent::Change => {
+                        let text = input.read(cx).value().to_string();
+                        if let Some(field) = this.search_input.as_mut() {
+                            field.sync = text.clone();
+                        }
+                        this.focus_search(text);
+                        cx.notify();
                     }
-                    this.focus_search(text);
-                    cx.notify();
+                    // Enter / Shift+Enter 在命中之间前后跳转。
+                    InputEvent::PressEnter { shift, .. } => {
+                        this.step_match(if *shift { -1 } else { 1 });
+                        cx.notify();
+                    }
+                    _ => {}
                 }
             });
             self.search_input = Some(EntityInput { state, sync: self.search.clone(), _sub: subscription });
@@ -1324,105 +1681,173 @@ impl Render for DiagramPane {
         let search = self.search_field(window, cx);
         let diagram = self.diagram.clone();
         let hovered = self.hovered.clone();
+        let selected = self.selected.clone();
         let highlight = self.highlight.clone();
-        let menu_table = self.card_menu.clone();
         let zoom = self.zoom;
         let mono = cx.theme().mono_font_family.clone();
-        let title = SharedString::from(if self.label.is_empty() { i18n::text(locale, "catalog.tree.diagram") } else { self.label.clone() });
+        // 标题写全范围：连接 / 库（.模式），不只是一个连接名。
+        let scope = match (self.database.is_empty(), self.schema.is_empty()) {
+            (false, false) => format!("{}.{}", self.database, self.schema),
+            (false, true) => self.database.clone(),
+            (true, false) => self.schema.clone(),
+            (true, true) => String::new(),
+        };
+        let title = SharedString::from(if self.label.is_empty() {
+            i18n::text(locale, "catalog.tree.diagram")
+        } else if scope.is_empty() || self.label.ends_with(&scope) {
+            self.label.clone()
+        } else {
+            format!("{} / {scope}", self.label)
+        });
         let viewport_w = window.viewport_size().width.as_f32();
         let pad_metrics = metrics.for_viewport(viewport_w);
         let narrow = viewport_w < kit::NARROW_PAGE_WIDTH;
         let layout_pad = pad_metrics.page_pad;
+        let searching = !self.search.trim().is_empty();
+        let match_count = self.matches.len();
+        let match_index = self.match_index;
+        let customized = !self.offsets.is_empty() || !self.expanded.is_empty();
         let tools = stack_frame(|| {
-        let zoom_out = {
-            let entity = entity.clone();
-            kit::icon_button("diagram-zoom-out", IconName::Minus, t("diagram.zoom.out"), move |_, _, cx| {
-                entity.update(cx, |pane, cx| pane.command("diagram-zoom-out", cx))
-            })
-        };
-        let zoom_in = {
-            let entity = entity.clone();
-            kit::icon_button("diagram-zoom-in", IconName::Plus, t("diagram.zoom.in"), move |_, _, cx| {
-                entity.update(cx, |pane, cx| pane.command("diagram-zoom-in", cx))
-            })
-        };
-        let zoom_reset = {
-            let entity = entity.clone();
-            kit::tool_button("diagram-zoom-reset", None, t("diagram.zoom.reset"), move |_, _, cx| {
-                entity.update(cx, |pane, cx| pane.command("diagram-zoom-reset", cx))
-            })
-        };
-        let zoom_fit = {
-            let entity = entity.clone();
-            kit::tool_button("diagram-zoom-fit", Some(IconName::Maximize), t("diagram.zoom.fit"), move |_, window, cx| {
-                let size = window.viewport_size();
-                entity.update(cx, |pane, cx| {
-                    pane.fit_view(size.width.as_f32(), size.height.as_f32());
-                    cx.notify();
-                });
-            })
-        };
-        let back = {
-            let entity = entity.clone();
-            kit::tool_button("diagram-back", Some(IconName::ArrowLeft), t("compare.back"), move |_, _, cx| {
-                entity.update(cx, |pane, cx| pane.command("diagram-back", cx))
-            })
-        };
-
-        // 只读说明放进标题的悬停提示，不常驻占一行。页头高度和左右边距走统一令牌。
-        // 窄窗口把搜索框与缩放/返回换到第二行：页头不撑宽，页面本身不出现横向滚动。
-        let search_box = if narrow {
-            div().flex_1().min_w(px(0.)).child(kit::text_input("diagram-search", &search, t("diagram.search")))
-        } else {
-            div().w(px(180.)).child(kit::text_input("diagram-search", &search, t("diagram.search")))
-        };
-        (search_box, zoom_out, zoom_reset, zoom_in, zoom_fit, back)
+            let zoom_out = {
+                let entity = entity.clone();
+                kit::icon_button("diagram-zoom-out", IconName::Minus, t("diagram.zoom.out"), move |_, _, cx| {
+                    entity.update(cx, |pane, cx| pane.command("diagram-zoom-out", cx))
+                })
+            };
+            let zoom_in = {
+                let entity = entity.clone();
+                kit::icon_button("diagram-zoom-in", IconName::Plus, t("diagram.zoom.in"), move |_, _, cx| {
+                    entity.update(cx, |pane, cx| pane.command("diagram-zoom-in", cx))
+                })
+            };
+            // 缩放比例就是复位按钮：一眼看到当前比例，点一下回到 100%。
+            let zoom_reset = {
+                let entity = entity.clone();
+                kit::tool_button("diagram-zoom-reset", None, SharedString::from(format!("{}%", (zoom * 100.).round() as i32)), move |_, _, cx| {
+                    entity.update(cx, |pane, cx| pane.command("diagram-zoom-reset", cx))
+                })
+                .tooltip(t("diagram.zoom.resetHint"))
+            };
+            let zoom_fit = {
+                let entity = entity.clone();
+                kit::tool_button("diagram-zoom-fit", Some(IconName::Maximize), t("diagram.zoom.fit"), move |_, window, cx| {
+                    let size = window.viewport_size();
+                    entity.update(cx, |pane, cx| {
+                        pane.fit_view(size.width.as_f32(), size.height.as_f32());
+                        cx.notify();
+                    });
+                })
+            };
+            let layout_reset = customized.then(|| {
+                let entity = entity.clone();
+                kit::tool_button("diagram-layout-reset", Some(IconName::RotateCcw), t("diagram.layoutReset"), move |_, _, cx| {
+                    entity.update(cx, |pane, cx| pane.command("diagram-layout-reset", cx))
+                })
+            });
+            let back = {
+                let entity = entity.clone();
+                kit::tool_button("diagram-back", Some(IconName::ArrowLeft), t("compare.back"), move |_, _, cx| {
+                    entity.update(cx, |pane, cx| pane.command("diagram-back", cx))
+                })
+            };
+            // 搜索框后面跟着命中计数与上一处/下一处；Enter / Shift+Enter 等价。
+            let mut search_box = div().flex().items_center().gap(px(Space::XS));
+            search_box = if narrow { search_box.flex_1().min_w(px(0.)) } else { search_box.flex_none() };
+            let input = kit::text_input("diagram-search", &search, t("diagram.search"))
+                .prefix(kit::input_prefix(IconName::Search, 13., p.text_faint))
+                .cleanable(true);
+            search_box = search_box.child(if narrow { div().flex_1().min_w(px(0.)).child(input) } else { div().w(px(220.)).child(input) });
+            if searching && match_count > 0 {
+                let prev = {
+                    let entity = entity.clone();
+                    kit::icon_button("diagram-search-prev", IconName::ChevronUp, t("grid.find.prev"), move |_, _, cx| {
+                        entity.update(cx, |pane, cx| pane.command("diagram-search-prev", cx))
+                    })
+                    .xsmall()
+                    .disabled(match_count < 2)
+                };
+                let next = {
+                    let entity = entity.clone();
+                    kit::icon_button("diagram-search-next", IconName::ChevronDown, t("grid.find.next"), move |_, _, cx| {
+                        entity.update(cx, |pane, cx| pane.command("diagram-search-next", cx))
+                    })
+                    .xsmall()
+                    .disabled(match_count < 2)
+                };
+                search_box = search_box
+                    .child(
+                        div()
+                            .id("diagram-search-count")
+                            .flex_none()
+                            .text_size(px(TypeScale::XS))
+                            .font_features(kit::tabular_figures())
+                            .text_color(p.text_muted)
+                            .child(SharedString::from(format!("{} / {match_count}", match_index + 1))),
+                    )
+                    .child(prev)
+                    .child(next);
+            }
+            (search_box, zoom_out, zoom_reset, zoom_in, zoom_fit, layout_reset, back)
         });
+        let stats = diagram.as_ref().map(|diagram| {
+            SharedString::from(i18n::fill(
+                &i18n::text(locale, "diagram.stats"),
+                &[("tables", &diagram.tables.len().to_string()), ("keys", &diagram.edges.len().to_string())],
+            ))
+        });
+        let stats_el = stats.clone().map(|text| div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(text));
         let header = if narrow {
             stack_frame(|| {
-            let (search_box, zoom_out, zoom_reset, zoom_in, zoom_fit, back) = tools;
-            div()
-                .id("diagram-header")
-                .flex_none()
-                .flex()
-                .flex_col()
-                .bg(p.surface)
-                .border_b_1()
-                .border_color(p.line)
-                .child(div().id("diagram-title").tooltip_text(t("diagram.readonly")).child(kit::page_header(title, &[], &pad_metrics, &p)))
-                .child(
-                    div()
-                        .id("diagram-tools")
-                        .test_support()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .px(px(layout_pad))
-                        .pb(px(8.))
-                        .child(search_box)
-                        .child(zoom_out)
-                        .child(zoom_reset)
-                        .child(zoom_in)
-                        .child(zoom_fit)
-                        .child(back),
-                )
-            .into_any_element()
+                let (search_box, zoom_out, zoom_reset, zoom_in, zoom_fit, layout_reset, back) = tools;
+                div()
+                    .id("diagram-header")
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .bg(p.surface)
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(div().id("diagram-title").tooltip_text(t("diagram.readonly")).child(kit::page_header(title, &[], &pad_metrics, &p).children(stats_el)))
+                    .child(
+                        div()
+                            .id("diagram-tools")
+                            .test_support()
+                            .flex()
+                            .items_center()
+                            .gap(px(Space::SM))
+                            .px(px(layout_pad))
+                            .pb(px(Space::MD))
+                            .child(search_box)
+                            .child(zoom_out)
+                            .child(zoom_reset)
+                            .child(zoom_in)
+                            .child(zoom_fit)
+                            .children(layout_reset)
+                            .child(back),
+                    )
+                    .into_any_element()
             })
         } else {
             stack_frame(|| {
-            let (search_box, zoom_out, zoom_reset, zoom_in, zoom_fit, back) = tools;
-            div().id("diagram-header").flex_none().flex().flex_col().child(
-                div().id("diagram-title").tooltip_text(t("diagram.readonly")).child(
-                    kit::page_header(title, &[], &pad_metrics, &p)
-                        .child(search_box)
-                        .child(zoom_out)
-                        .child(zoom_reset)
-                        .child(zoom_in)
-                        .child(zoom_fit)
-                        .child(back),
-                ),
-            )
-            .into_any_element()
+                let (search_box, zoom_out, zoom_reset, zoom_in, zoom_fit, layout_reset, back) = tools;
+                div()
+                    .id("diagram-header")
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div().id("diagram-title").tooltip_text(t("diagram.readonly")).child(
+                            kit::page_header(title, &[], &pad_metrics, &p)
+                                .children(stats_el)
+                                .child(div().flex_1())
+                                .child(search_box)
+                                .child(div().flex().items_center().gap(px(Space::XXS)).child(zoom_out).child(zoom_reset).child(zoom_in))
+                                .child(zoom_fit)
+                                .children(layout_reset)
+                                .child(back),
+                        ),
+                    )
+                    .into_any_element()
             })
         };
 
@@ -1435,13 +1860,13 @@ impl Render for DiagramPane {
             div()
                 .flex()
                 .items_center()
-                .gap(px(6.))
+                .gap(px(Space::SM))
                 .child(kit::kbd(kit::shortcut("Ctrl+B"), &p))
                 .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("shell.command.toggleSidebar"))),
             &p,
         )
         .into_any_element();
-        let mut body = div().id("diagram-scroll").flex_1().min_h(px(0.)).overflow_hidden().bg(p.chrome);
+        let mut body = div().id("diagram-scroll").relative().flex_1().min_h(px(0.)).overflow_hidden().bg(p.chrome).flex().flex_col();
         if matches!(pane_state, PaneState::Loading) {
             body = body.child(
                 div()
@@ -1487,94 +1912,135 @@ impl Render for DiagramPane {
                     .child(kit::empty_state_with_action(IconName::Workflow, t("diagram.empty"), detail, reread, &p)),
             );
         } else if let Some(diagram) = diagram.as_ref() {
-            {
-                // 搜索无命中只加一条提示条：画布保持可见，清空条件即恢复现场。
-                if !self.search.trim().is_empty() && highlight.is_none() {
-                    let clear = {
-                        let entity = entity.clone();
-                        kit::secondary_button("diagram-search-clear", None, t("diagram.searchClear"), move |_, _, cx| {
-                            entity.update(cx, |pane, cx| pane.command("diagram-search-clear", cx))
-                        })
-                    };
-                    body = body.child(
-                        div()
-                            .id("diagram-no-match")
-                            .test_support()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .px(px(layout_pad))
-                            .py(px(6.))
-                            .bg(p.surface)
-                            .border_b_1()
-                            .border_color(p.line)
-                            .child(kit::icon(IconName::SearchX, 13., p.text_muted))
-                            .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("diagram.searchNoMatch")))
-                            .child(clear),
-                    );
+            // 搜索无命中只加一条提示条：画布保持可见，清空条件即恢复现场。
+            if searching && highlight.is_none() {
+                let clear = {
+                    let entity = entity.clone();
+                    kit::secondary_button("diagram-search-clear", None, t("diagram.searchClear"), move |_, _, cx| {
+                        entity.update(cx, |pane, cx| pane.command("diagram-search-clear", cx))
+                    })
+                };
+                body = body.child(
+                    div()
+                        .id("diagram-no-match")
+                        .test_support()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(Space::MD))
+                        .px(px(layout_pad))
+                        .py(px(Space::SM))
+                        .bg(p.surface)
+                        .border_b_1()
+                        .border_color(p.line)
+                        .child(kit::icon(IconName::SearchX, 13., p.text_muted))
+                        .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("diagram.searchNoMatch")))
+                        .child(clear),
+                );
+            }
+            let foreign = foreign_columns(diagram);
+            // 每张卡片要画的列（长表折叠）与未缩放高度。
+            let mut shown: std::collections::HashMap<String, (Vec<usize>, usize)> = std::collections::HashMap::new();
+            let mut heights: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+            for table in &diagram.tables {
+                let (rows, hidden) = visible_columns(table, &foreign, self.expanded.contains(&table.name));
+                let folded = hidden > 0 || self.expanded.contains(&table.name) && table.columns.len() > COLLAPSE_AT;
+                heights.insert(table.name.clone(), card_height_for(table, rows.len(), folded));
+                shown.insert(table.name.clone(), (rows, hidden));
+            }
+            // 卡片位置：自动布局 + 用户拖过的偏移。先算未缩放坐标，再平移和缩放。
+            let mut base = auto_layout(&diagram.tables, &diagram.edges, &heights);
+            for (name, (dx, dy)) in &self.offsets {
+                if let Some(place) = base.get_mut(name) {
+                    place.0 += dx;
+                    place.1 += dy;
                 }
-                let columns = layout_columns(&diagram.tables, &diagram.edges);
-                let foreign = foreign_columns(diagram);
-                // 卡片位置：按列从左到右，被引用的表在左。先算未缩放坐标，再平移和缩放。
-                let mut places: std::collections::HashMap<String, (f32, f32, f32)> = std::collections::HashMap::new();
-                let mut width = 0f32;
-                let mut height = 0f32;
-                for (index, column) in columns.iter().enumerate() {
-                    let x = PAD + index as f32 * (CARD_W + GAP_X);
-                    let mut y = PAD;
-                    for table in column {
-                        let h = card_height(table);
-                        places.insert(table.name.clone(), (x, y, h));
-                        y += h + GAP_Y;
-                    }
-                    width = width.max(x + CARD_W + PAD);
-                    height = height.max(y + PAD);
-                }
-                self.content_w = width;
-                self.content_h = height;
-                if self.center_pending {
-                    self.center_pending = false;
-                    if let Some(name) = highlight.clone() {
-                        if let Some(&(x, y, h)) = places.get(&name) {
+            }
+            let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, 0f32, 0f32);
+            for (name, (x, y)) in &base {
+                let h = heights.get(name).copied().unwrap_or(HEAD_H);
+                min_x = min_x.min(*x);
+                min_y = min_y.min(*y);
+                max_x = max_x.max(x + CARD_W);
+                max_y = max_y.max(y + h);
+            }
+            if base.is_empty() {
+                (min_x, min_y) = (0., 0.);
+            }
+            // 内容范围（未缩放）：含用户拖到左上方的卡片，适应视口按它算。
+            self.content_x0 = min_x.min(PAD) - PAD;
+            self.content_y0 = min_y.min(PAD) - PAD;
+            self.content_w = max_x + PAD - self.content_x0;
+            self.content_h = max_y + PAD - self.content_y0;
+            let center = self.center_target.take().or_else(|| if self.center_pending { highlight.clone() } else { None });
+            if self.center_pending || center.is_some() {
+                if let Some(name) = center {
+                    if let Some(&(x, y)) = base.get(&name) {
+                        let h = heights.get(&name).copied().unwrap_or(HEAD_H);
+                        let board = self.board.get();
+                        let (w, vh) = if board.size.width.as_f32() > 1. {
+                            (board.size.width.as_f32(), board.size.height.as_f32())
+                        } else {
                             let view = window.viewport_size();
-                            self.pan_x = view.width.as_f32() * 0.45 - (x + CARD_W * 0.5) * zoom;
-                            self.pan_y = view.height.as_f32() * 0.35 - (y + h * 0.5) * zoom;
-                        }
+                            (view.width.as_f32() * 0.8, view.height.as_f32() * 0.8)
+                        };
+                        self.pan_x = w * 0.5 - (x + CARD_W * 0.5) * zoom;
+                        self.pan_y = vh * 0.4 - (y + h.min(400.) * 0.5) * zoom;
                     }
                 }
-                let pan_x = self.pan_x;
-                let pan_y = self.pan_y;
-                for place in places.values_mut() {
-                    place.0 = pan_x + place.0 * zoom;
-                    place.1 = pan_y + place.1 * zoom;
-                    place.2 *= zoom;
-                }
-                let board_w = (pan_x + width * zoom).max(400.);
-                let board_h = (pan_y + height * zoom).max(300.);
-                let card_w = CARD_W * zoom;
-                let head_h = HEAD_H * zoom;
-                let row_h = ROW_H * zoom;
-                let board_entity = entity.clone();
-                let mut canvas_box = stack_frame(|| {
-                let mut canvas_box = div()
+                self.center_pending = false;
+            }
+            let pan_x = self.pan_x;
+            let pan_y = self.pan_y;
+            let places: std::collections::HashMap<String, (f32, f32, f32)> = base
+                .iter()
+                .map(|(name, (x, y))| {
+                    let h = heights.get(name).copied().unwrap_or(HEAD_H);
+                    (name.clone(), (pan_x + x * zoom, pan_y + y * zoom, h * zoom))
+                })
+                .collect();
+            let card_w = CARD_W * zoom;
+            let head_h = HEAD_H * zoom;
+            let row_h = ROW_H * zoom;
+            // 悬停优先，其次是选中的卡片：关联表与连线高亮，其余变淡。
+            let focus = hovered.clone().or(selected.clone());
+            let matches: std::collections::HashSet<String> = if searching { self.matches.iter().cloned().collect() } else { Default::default() };
+            let dragging = self.drag.as_ref().is_some_and(|drag| drag.moved) || self.card_drag.as_ref().is_some_and(|drag| drag.moved);
+            let board_entity = entity.clone();
+            let board_cell = self.board.clone();
+            let mut canvas_box = stack_frame(|| {
+                div()
                     .id("diagram-board")
                     .test_support()
                     .relative()
-                    .w(px(board_w))
-                    .h(px(board_h))
+                    .flex_1()
+                    .min_h(px(0.))
+                    .w_full()
+                    .when(dragging, |this| this.cursor_grabbing())
+                    // 滚轮/触控板平移画布；按住 ⌘/Ctrl 滚动时以指针为中心缩放。
                     .on_scroll({
                         let board_entity = board_entity.clone();
+                        let board_cell = board_cell.clone();
                         move |event: &ScrollEvent, _, cx| {
-                            let steps = match event.delta {
-                                ScrollDelta::Pixels(point) => point.y.as_f32() / 80.,
-                                ScrollDelta::Lines(point) => point.y,
+                            let zooming = event.modifiers.secondary(cx) || event.modifiers.control;
+                            let (dx, dy) = match event.delta {
+                                ScrollDelta::Pixels(point) => (point.x.as_f32(), point.y.as_f32()),
+                                ScrollDelta::Lines(point) => (point.x * 40., point.y * 40.),
                             };
-                            if steps.abs() < 0.01 {
+                            if dx.abs() < 0.01 && dy.abs() < 0.01 {
                                 return;
                             }
+                            let origin = board_cell.get().origin;
+                            let local_x = (event.position.x - origin.x).as_f32();
+                            let local_y = (event.position.y - origin.y).as_f32();
                             board_entity.update(cx, |pane, cx| {
-                                pane.zoom = clamp_zoom(pane.zoom + steps * 0.1);
+                                if zooming {
+                                    let factor = (1. + dy / 400.).clamp(0.8, 1.25);
+                                    pane.zoom_at(pane.zoom * factor, local_x, local_y);
+                                } else {
+                                    pane.pan_x += dx;
+                                    pane.pan_y += dy;
+                                }
                                 cx.notify();
                             });
                         }
@@ -1590,16 +2056,15 @@ impl Render for DiagramPane {
                         move |event: &MouseDownEvent, _, cx| {
                             board_entity.update(cx, |pane, _| pane.begin_drag(event.position.x.as_f32(), event.position.y.as_f32()));
                         }
-                    });
-                canvas_box = stack_frame(|| {
-                let canvas_box = canvas_box;
+                    })
+            });
+            canvas_box = stack_frame(|| {
                 canvas_box
                     .on_mouse_move({
                         let board_entity = board_entity.clone();
                         move |event: &MouseMoveEvent, _, cx| {
                             board_entity.update(cx, |pane, cx| {
-                                if pane.drag.is_some() {
-                                    pane.move_drag(event.position.x.as_f32(), event.position.y.as_f32());
+                                if pane.pointer_move(event.position.x.as_f32(), event.position.y.as_f32()) {
                                     cx.notify();
                                 }
                             });
@@ -1609,7 +2074,7 @@ impl Render for DiagramPane {
                         let board_entity = board_entity.clone();
                         move |_: &gpui_kit::MouseUpEvent, _, cx| {
                             board_entity.update(cx, |pane, cx| {
-                                pane.end_drag();
+                                pane.pointer_up();
                                 cx.notify();
                             });
                         }
@@ -1623,296 +2088,336 @@ impl Render for DiagramPane {
                             });
                         }
                     })
-                });
-                // 连线单独一帧，避免和画板事件叠在同一个未优化栈帧里。
-                let wires_layer = stack_frame(|| {
+            });
+            // 连线单独一帧，避免和画板事件叠在同一个未优化栈帧里。
+            let wires_layer = stack_frame(|| {
+                let row_center = |table: &str, column: Option<&String>| -> Option<f32> {
+                    let source = diagram.tables.iter().find(|item| item.name == table)?;
+                    let index = column_index(source, column?)?;
+                    let (rows, _) = shown.get(table)?;
+                    let visible = rows.iter().position(|row| *row == index)?;
+                    Some(HEAD_H + 5. + ROW_H * visible as f32 + ROW_H / 2.)
+                };
                 let mut wires: Vec<(gpui_kit::Point<gpui_kit::Pixels>, gpui_kit::Point<gpui_kit::Pixels>, bool)> = Vec::new();
                 for edge in &diagram.edges {
                     let (Some(from), Some(to)) = (places.get(&edge.from_table), places.get(&edge.to_table)) else { continue };
-                    let from_table = diagram.tables.iter().find(|table| table.name == edge.from_table);
-                    let row = from_table.and_then(|table| edge.from_columns.first().and_then(|column| column_index(table, column))).unwrap_or(0);
-                    let start_y = from.1 + (HEAD_H + ROW_H * row as f32 + ROW_H / 2. + 5.) * zoom;
-                    let end_y = to.1 + head_h / 2.;
-                    let (start_x, end_x) = if from.0 > to.0 { (from.0, to.0 + card_w) } else if from.0 < to.0 { (from.0 + card_w, to.0) } else { (from.0 + card_w, to.0 + card_w) };
-                    wires.push((gpui_kit::point(px(start_x), px(start_y)), gpui_kit::point(px(end_x), px(end_y)), edge_hot(hovered.as_deref(), edge)));
+                    let start_y = from.1 + row_center(&edge.from_table, edge.from_columns.first()).unwrap_or(HEAD_H / 2.) * zoom;
+                    let end_y = to.1 + row_center(&edge.to_table, edge.to_columns.first()).map(|y| y * zoom).unwrap_or(head_h / 2.);
+                    let (start_x, end_x) = if from.0 > to.0 + card_w {
+                        (from.0, to.0 + card_w)
+                    } else if from.0 + card_w < to.0 {
+                        (from.0 + card_w, to.0)
+                    } else {
+                        (from.0 + card_w, to.0 + card_w)
+                    };
+                    wires.push((gpui_kit::point(px(start_x), px(start_y)), gpui_kit::point(px(end_x), px(end_y)), edge_hot(focus.as_deref(), edge)));
                 }
-                let dim = hovered.is_some();
+                let dim = focus.is_some();
                 let (wire, hot_wire, dim_wire) = (p.line_strong, p.accent, p.line);
+                let cell = board_cell.clone();
                 canvas(
-                        move |_, _, _| (),
-                        move |bounds, _, window, _| {
-                            for (start, end, hot) in &wires {
-                                let start = bounds.origin + *start;
-                                let end = bounds.origin + *end;
-                                let bend = ((end.x - start.x).abs() / 2.).max(px(40.));
-                                let same_side = (start.x - end.x).abs() < px(1.);
-                                let (c1, c2) = if same_side {
-                                    (gpui_kit::point(start.x + px(60.), start.y), gpui_kit::point(end.x + px(60.), end.y))
-                                } else if start.x > end.x {
-                                    (gpui_kit::point(start.x - bend, start.y), gpui_kit::point(end.x + bend, end.y))
-                                } else {
-                                    (gpui_kit::point(start.x + bend, start.y), gpui_kit::point(end.x - bend, end.y))
-                                };
-                                let mut builder = PathBuilder::stroke(px(if *hot { 2. } else { 1.3 }));
-                                builder.move_to(start);
-                                builder.cubic_bezier_to(end, c1, c2);
-                                if let Ok(path) = builder.build() {
-                                    let color = if *hot { hot_wire } else if dim { dim_wire } else { wire };
-                                    window.paint_path(path, color);
-                                    paint_arrow(end, c2, color, window);
-                                }
+                    move |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        cell.set(bounds);
+                        // 高亮的连线最后画，压在其它线上面。
+                        let mut ordered: Vec<&(gpui_kit::Point<gpui_kit::Pixels>, gpui_kit::Point<gpui_kit::Pixels>, bool)> = wires.iter().collect();
+                        ordered.sort_by_key(|(_, _, hot)| *hot);
+                        for (start, end, hot) in ordered {
+                            let start = bounds.origin + *start;
+                            let end = bounds.origin + *end;
+                            let bend = ((end.x - start.x).abs() / 2.).max(px(40.));
+                            let same_side = (start.x - end.x).abs() < px(1.);
+                            let (c1, c2) = if same_side {
+                                (gpui_kit::point(start.x + px(60.), start.y), gpui_kit::point(end.x + px(60.), end.y))
+                            } else if start.x > end.x {
+                                (gpui_kit::point(start.x - bend, start.y), gpui_kit::point(end.x + bend, end.y))
+                            } else {
+                                (gpui_kit::point(start.x + bend, start.y), gpui_kit::point(end.x - bend, end.y))
+                            };
+                            let mut builder = PathBuilder::stroke(px(if *hot { 2. } else { 1.3 }));
+                            builder.move_to(start);
+                            builder.cubic_bezier_to(end, c1, c2);
+                            if let Ok(path) = builder.build() {
+                                let color = if *hot { hot_wire } else if dim { dim_wire } else { wire };
+                                window.paint_path(path, color);
+                                paint_arrow(end, c2, color, window);
                             }
-                        },
-                    )
-                    .absolute()
-                    .inset_0()
-                    .into_any_element()
-                });
-                canvas_box = canvas_box.child(wires_layer);
-                canvas_box
-                });
-                for column in &columns {
-                    for table in column {
-                        let Some((x, y, _)) = places.get(&table.name).copied() else { continue };
-                        let card = stack_frame(|| {
-                        let name = table.name.clone();
-                        let mark = hover_mark(hovered.as_deref(), &name, diagram);
-                        let label = SharedString::from(format!("{mark} {}", table.name));
-                        let hovered_name = name.clone();
-                        let card_entity = entity.clone();
-                        let (mut border, head_bg, opacity) = match mark {
-                            "hot" => (p.accent, p.accent_soft, 1.),
-                            "linked" => (p.accent, p.surface, 1.),
-                            "dim" => (p.line, p.surface, 0.45),
-                            _ => (p.line_strong, p.surface, 1.),
-                        };
-                        if highlight.as_deref() == Some(table.name.as_str()) {
-                            border = p.accent;
+                            // 起点画一个小圆点，看得出线从哪一列出发。
+                            let mut dot = PathBuilder::fill();
+                            let r = px(2.5);
+                            dot.move_to(gpui_kit::point(start.x - r, start.y));
+                            dot.arc_to(gpui_kit::point(r, r), px(0.), false, true, gpui_kit::point(start.x + r, start.y));
+                            dot.arc_to(gpui_kit::point(r, r), px(0.), false, true, gpui_kit::point(start.x - r, start.y));
+                            if let Ok(path) = dot.build() {
+                                window.paint_path(path, if *hot { hot_wire } else if dim { dim_wire } else { wire });
+                            }
                         }
-                        let mut rows = div().flex().flex_col().py(px(5. * zoom));
-                        for column in &table.columns {
-                            let fk = foreign.contains(&(table.name.as_str(), column.name.as_str()));
-                            let icon = if column.primary {
-                                IconName::Key
-                            } else if fk {
-                                IconName::Link
-                            } else {
-                                IconName::Dot
-                            };
-                            let icon_color = if column.primary {
-                                p.warn
-                            } else if fk {
-                                p.accent
-                            } else {
-                                p.text_faint
-                            };
-                            rows = rows.child(
-                                div()
-                                    .h(px(row_h))
-                                    .px(px(12.))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .text_size(px(TypeScale::SM))
-                                    .child(kit::icon(icon, 11., icon_color))
-                                    .child(div().truncate().font_family(mono.clone()).when(fk, |this| this.text_color(p.accent_text)).child(SharedString::from(column.name.clone())))
-                                    .when(!column.type_name.is_empty(), |this| {
-                                        this.child(
-                                            div()
-                                                .ml_auto()
-                                                .truncate()
-                                                .text_size(px(TypeScale::XS))
-                                                .text_color(p.text_faint)
-                                                .child(SharedString::from(column.type_name.clone())),
-                                        )
-                                    }),
-                            );
-                        }
-                        if table.columns.is_empty() {
-                            rows = rows.child(div().h(px(ROW_H)).px(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child("—"));
-                        }
-                        for note in &table.outside {
-                            rows = rows.child(div().h(px(ROW_H)).px(px(12.)).flex().items_center().gap(px(6.)).text_size(px(TypeScale::XS)).text_color(p.warn).child(kit::icon(IconName::ExternalLink, 11., p.warn)).child(div().truncate().child(SharedString::from(note.clone()))));
-                        }
-                        let card = div()
-                                .id(SharedString::from(format!("diagram-card:{name}")))
-                                .test_support()
-                                .role(gpui_kit::Role::Button)
-                                .aria_label(label)
-                                .absolute()
-                                .left(px(x))
-                                .top(px(y))
-                                .w(px(card_w))
-                                .rounded(px(Radius::PANEL))
-                                .border_1()
-                                .border_color(border)
-                                .bg(p.surface)
-                                .shadow_sm()
-                                .overflow_hidden()
-                                .child(
-                                    div()
-                                        .h(px(head_h))
-                                        .px(px(12.))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(8.))
-                                        .bg(head_bg)
-                                        .border_b_1()
-                                        .border_color(p.line)
-                                        .child(kit::icon(IconName::Table, 13., p.accent))
-                                        .child(div().truncate().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(table.name.clone()))),
-                                )
-                                .child(rows)
-                                .on_mouse_down(MouseButton::Left, {
-                                    let name = name.clone();
-                                    let card_entity = card_entity.clone();
-                                    move |event: &MouseDownEvent, _, cx| {
-                                        // 双击次数在按下事件上。点下去就记下打开请求，不等点击合成，也不发 SQL。
-                                        if event.click_count >= 2 {
-                                            card_entity.update(cx, |pane, cx| {
-                                                pane.request_open(&name, false);
-                                                cx.notify();
-                                            });
-                                            cx.stop_propagation();
-                                        }
-                                    }
-                                })
-                                .on_mouse_up(MouseButton::Left, {
-                                    let name = name.clone();
-                                    let card_entity = card_entity.clone();
-                                    move |event: &gpui_kit::MouseUpEvent, _, cx| {
-                                        if event.click_count >= 2 {
-                                            card_entity.update(cx, |pane, cx| {
-                                                pane.request_open(&name, false);
-                                                cx.notify();
-                                            });
-                                        }
-                                    }
-                                })
-                                .on_click({
-                                    let name = name.clone();
-                                    let card_entity = card_entity.clone();
-                                    move |event: &ClickEvent, _, cx| {
-                                        let double = event.click_count() >= 2 && !event.is_secondary();
-                                        let secondary = event.is_secondary();
-                                        if !double && !secondary {
-                                            return;
-                                        }
-                                        card_entity.update(cx, |pane, cx| {
-                                            if double {
-                                                pane.request_open(&name, false);
-                                            } else {
-                                                pane.card_menu = Some(name.clone());
-                                            }
-                                            cx.notify();
-                                        });
-                                    }
-                                })
-                                .on_hover(move |inside, _, cx| {
-                                    let hovered_name = hovered_name.clone();
-                                    card_entity.update(cx, |pane, cx| {
-                                        if *inside {
-                                            pane.hovered = Some(hovered_name);
-                                        } else if pane.hovered.as_deref() == Some(hovered_name.as_str()) {
-                                            pane.hovered = None;
-                                        }
-                                        cx.notify();
-                                    });
-                                })
-                                .on_key_down({
-                                    // 卡片是 Tab 停靠点：Enter / Shift+Enter 打开，菜单键或 Shift+F10 出菜单，Esc 收起。
-                                    let name = name.clone();
-                                    let key_entity = entity.clone();
-                                    move |event: &gpui_kit::KeyDownEvent, _, cx| {
-                                        let key = event.keystroke.key.as_str();
-                                        let shift = event.keystroke.modifiers.shift;
-                                        let handled = key_entity.update(cx, |pane, cx| {
-                                            let handled = pane.card_key(&name, key, shift);
-                                            if handled {
-                                                cx.notify();
-                                            }
-                                            handled
-                                        });
-                                        if handled {
-                                            cx.stop_propagation();
-                                        }
-                                    }
-                                });
-                        kit::interactive(card, &p, false).opacity(opacity).into_any_element()
-                        });
-                        // hover / active / focus-visible / disabled 四态走底座，不再自己拼底色。
-                        // 悬停时其余卡片要按既有 dim 变淡，所以不透明度放在底座之后设置。
-                        canvas_box = canvas_box.child(card);
+                    },
+                )
+                .absolute()
+                .inset_0()
+                .into_any_element()
+            });
+            canvas_box = canvas_box.child(wires_layer);
+            for table in &diagram.tables {
+                let Some((x, y, _)) = places.get(&table.name).copied() else { continue };
+                let (rows_shown, hidden) = shown.get(&table.name).cloned().unwrap_or_default();
+                let expanded = self.expanded.contains(&table.name);
+                let card = stack_frame(|| {
+                    let name = table.name.clone();
+                    let mut mark = hover_mark(focus.as_deref(), &name, diagram);
+                    if focus.is_none() && searching && !matches.is_empty() && !matches.contains(&name) {
+                        mark = "dim";
                     }
-                }
-                body = body.child(canvas_box);
-                if let Some(name) = menu_table.clone() {
-                    let bar = stack_frame(|| {
-                    let open_data = {
-                        let entity = entity.clone();
-                        let table = name.clone();
-                        kit::tool_button(SharedString::from(format!("diagram-open-data:{table}")), Some(IconName::Table), t("diagram.openData"), move |_, _, cx| {
-                            let table = table.clone();
-                            entity.update(cx, |pane, cx| pane.command(&format!("diagram-open-data:{table}"), cx));
-                        })
+                    let label = SharedString::from(format!("{mark} {}", table.name));
+                    let hovered_name = name.clone();
+                    let card_entity = entity.clone();
+                    let is_selected = selected.as_deref() == Some(name.as_str());
+                    let is_hit = highlight.as_deref() == Some(table.name.as_str());
+                    let (mut border, head_bg, opacity) = match mark {
+                        "hot" => (p.accent, p.accent_soft, 1.),
+                        "linked" => (p.accent, p.surface, 1.),
+                        "dim" => (p.line, p.surface, 0.4),
+                        _ => (p.line_strong, p.raised, 1.),
                     };
-                    let open_structure = {
-                        let entity = entity.clone();
-                        let table = name.clone();
-                        kit::tool_button(SharedString::from(format!("diagram-open-structure:{table}")), Some(IconName::Columns3), t("diagram.openStructure"), move |_, _, cx| {
-                            let table = table.clone();
-                            entity.update(cx, |pane, cx| pane.command(&format!("diagram-open-structure:{table}"), cx));
-                        })
-                    };
-                    let menu_close = {
-                        let entity = entity.clone();
-                        kit::icon_button("diagram-menu-close", IconName::X, t("common.close"), move |_, _, cx| {
-                            entity.update(cx, |pane, cx| pane.command("diagram-menu-close", cx))
-                        })
-                    };
-                    let mut bar = div()
-                        .id("diagram-card-menu")
-                        .test_support()
-                        .flex_none()
-                        .px(px(layout_pad))
-                        .py(px(8.))
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(8.))
-                        .bg(p.surface)
-                        .border_t_1()
-                        .border_color(p.line)
-                        // 菜单条是页面内的一个岛：按下事件停在这里，页面根节点的“点别处收起”不会
-                        // 在按钮自己的点击合成完之前把它拆掉。
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(div().text_size(px(TypeScale::SM)).child(SharedString::from(name)))
-                        .child(open_data)
-                        .child(open_structure)
-                        .child(menu_close);
-                    if !narrow {
-                        // 菜单同时标出键盘等价键位：Enter 打开数据、Shift+Enter 看结构、Esc 收起。
-                        bar = bar.child(
+                    if is_hit || is_selected {
+                        border = p.accent;
+                    }
+                    let mut rows = div().flex().flex_col().py(px(5. * zoom));
+                    for index in &rows_shown {
+                        let column = &table.columns[*index];
+                        let fk = foreign.contains(&(table.name.as_str(), column.name.as_str()));
+                        let icon = if column.primary {
+                            IconName::Key
+                        } else if fk {
+                            IconName::Link
+                        } else {
+                            IconName::Dot
+                        };
+                        let icon_color = if column.primary {
+                            p.warn
+                        } else if fk {
+                            p.accent
+                        } else {
+                            p.text_faint
+                        };
+                        rows = rows.child(
                             div()
-                                .id("diagram-card-keys")
-                                .ml_auto()
+                                .h(px(row_h))
+                                .px(px(12. * zoom.min(1.)))
                                 .flex()
                                 .items_center()
-                                .gap(px(4.))
-                                .child(kit::kbd(kit::shortcut("Enter"), &p))
-                                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t("diagram.openData")))
-                                .child(div().w(px(8.)))
-                                .child(kit::kbd(kit::shortcut("Shift+Enter"), &p))
-                                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t("diagram.openStructure")))
-                                .child(div().w(px(8.)))
-                                .child(kit::kbd("Esc", &p))
-                                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t("common.close"))),
+                                .gap(px(Space::SM))
+                                .text_size(px(TypeScale::SM))
+                                .child(kit::icon(icon, 11., icon_color))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_family(mono.clone())
+                                        .when(column.primary, |this| this.font_weight(FontWeight::MEDIUM))
+                                        .when(fk, |this| this.text_color(p.accent_text))
+                                        .child(SharedString::from(column.name.clone())),
+                                )
+                                .when(!column.type_name.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .ml_auto()
+                                            .flex_none()
+                                            .max_w(px(96. * zoom))
+                                            .truncate()
+                                            .text_size(px(TypeScale::XS))
+                                            .text_color(p.text_faint)
+                                            .child(SharedString::from(column.type_name.clone())),
+                                    )
+                                }),
                         );
                     }
-                    bar
-                    });
-                    body = body.child(bar);
-                }
+                    if table.columns.is_empty() {
+                        rows = rows.child(div().h(px(row_h)).px(px(Space::LG)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child("—"));
+                    }
+                    // 折叠的长表：一行“+N 列”，点一下展开；展开后可以收起。
+                    if hidden > 0 || (expanded && table.columns.len() > COLLAPSE_AT) {
+                        let toggle_entity = entity.clone();
+                        let toggle_name = name.clone();
+                        let text = if hidden > 0 {
+                            i18n::fill(&i18n::text(locale, "diagram.moreColumns"), &[("count", &hidden.to_string())])
+                        } else {
+                            i18n::text(locale, "diagram.collapseColumns")
+                        };
+                        rows = rows.child(
+                            div()
+                                .id(SharedString::from(format!("diagram-expand:{name}")))
+                                .h(px(row_h))
+                                .px(px(Space::LG))
+                                .flex()
+                                .items_center()
+                                .gap(px(Space::SM))
+                                .cursor_pointer()
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.accent_text)
+                                .hover(|this| this.bg(p.hover))
+                                .child(kit::icon(if hidden > 0 { IconName::ChevronDown } else { IconName::ChevronUp }, 11., p.accent_text))
+                                .child(SharedString::from(text))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(move |_, _, cx| {
+                                    let id = format!("diagram-expand:{toggle_name}");
+                                    toggle_entity.update(cx, |pane, cx| pane.command(&id, cx));
+                                }),
+                        );
+                    }
+                    for note in &table.outside {
+                        rows = rows.child(
+                            div()
+                                .h(px(row_h))
+                                .px(px(Space::LG))
+                                .flex()
+                                .items_center()
+                                .gap(px(Space::SM))
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.warn)
+                                .child(kit::icon(IconName::ExternalLink, 11., p.warn))
+                                .child(div().truncate().child(SharedString::from(note.clone()))),
+                        );
+                    }
+                    let card = div()
+                        .id(SharedString::from(format!("diagram-card:{name}")))
+                        .test_support()
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(label)
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(card_w))
+                        .rounded(px(Radius::PANEL))
+                        .when(is_selected || is_hit, |this| this.border_2())
+                        .when(!(is_selected || is_hit), |this| this.border_1())
+                        .border_color(border)
+                        .bg(p.surface)
+                        .when(is_selected, |this| this.shadow_md())
+                        .when(!is_selected, |this| this.shadow_sm())
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("diagram-card-head:{name}")))
+                                .h(px(head_h))
+                                .px(px(12. * zoom.min(1.)))
+                                .flex()
+                                .items_center()
+                                .gap(px(Space::MD))
+                                .bg(head_bg)
+                                .border_b_1()
+                                .border_color(p.line)
+                                .cursor_grab()
+                                .tooltip_text(SharedString::from(table.name.clone()))
+                                .child(kit::icon(IconName::Table, 13., p.accent))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(TypeScale::MD))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(SharedString::from(table.name.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(TypeScale::XS))
+                                        .font_features(kit::tabular_figures())
+                                        .text_color(p.text_faint)
+                                        .child(SharedString::from(table.columns.len().to_string())),
+                                ),
+                        )
+                        .child(rows)
+                        .on_mouse_down(MouseButton::Left, {
+                            let name = name.clone();
+                            let card_entity = card_entity.clone();
+                            move |event: &MouseDownEvent, _, cx| {
+                                // 双击打开数据；单击按下开始拖动卡片（没拖动就是选中）。不平移画布、不发 SQL。
+                                let double = event.click_count >= 2;
+                                card_entity.update(cx, |pane, cx| {
+                                    if double {
+                                        pane.card_drag = None;
+                                        pane.request_open(&name, false);
+                                    } else {
+                                        pane.begin_card_drag(&name, event.position.x.as_f32(), event.position.y.as_f32());
+                                    }
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            }
+                        })
+                        .on_mouse_down(MouseButton::Right, {
+                            let name = name.clone();
+                            let card_entity = card_entity.clone();
+                            move |event: &MouseDownEvent, _, cx| {
+                                // 右键：选中这张表并请外壳弹出表级菜单（与对象树同一册）。
+                                card_entity.update(cx, |pane, cx| {
+                                    pane.open_card_menu(&name, Some(event.position));
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            }
+                        })
+                        .on_hover(move |inside, _, cx| {
+                            let hovered_name = hovered_name.clone();
+                            card_entity.update(cx, |pane, cx| {
+                                if pane.card_drag.as_ref().is_some_and(|drag| drag.moved) {
+                                    return;
+                                }
+                                if *inside {
+                                    pane.hovered = Some(hovered_name);
+                                } else if pane.hovered.as_deref() == Some(hovered_name.as_str()) {
+                                    pane.hovered = None;
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .on_key_down({
+                            // 卡片是 Tab 停靠点：Enter / Shift+Enter 打开，空格选中，菜单键或 Shift+F10 出菜单，Esc 收起。
+                            let name = name.clone();
+                            let key_entity = entity.clone();
+                            move |event: &gpui_kit::KeyDownEvent, _, cx| {
+                                let key = event.keystroke.key.as_str();
+                                let shift = event.keystroke.modifiers.shift;
+                                let handled = key_entity.update(cx, |pane, cx| {
+                                    let handled = pane.card_key(&name, key, shift);
+                                    if handled {
+                                        cx.notify();
+                                    }
+                                    handled
+                                });
+                                if handled {
+                                    cx.stop_propagation();
+                                }
+                            }
+                        });
+                    // hover / active / focus-visible / disabled 四态走底座，不再自己拼底色。
+                    // 悬停时其余卡片要按既有 dim 变淡，所以不透明度放在底座之后设置。
+                    kit::interactive(card, &p, false).opacity(opacity).into_any_element()
+                });
+                canvas_box = canvas_box.child(card);
+            }
+            body = body.child(canvas_box);
+            // 画布左下角的操作提示：第一次用的人知道能拖、能滚、能右键。
+            if !narrow {
+                body = body.child(
+                    div()
+                        .id("diagram-hint")
+                        .absolute()
+                        .left(px(Space::LG))
+                        .bottom(px(Space::MD))
+                        .px(px(Space::MD))
+                        .py(px(3.))
+                        .rounded(px(Radius::CONTROL))
+                        .bg(p.surface)
+                        .border_1()
+                        .border_color(p.line_soft)
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_faint)
+                        .child(t("diagram.hint")),
+                );
             }
         } else {
             // 兜底与 NeedTarget 同一份呈现，不再出现第五种状态。
@@ -1920,61 +2425,54 @@ impl Render for DiagramPane {
         }
 
         let footer = stack_frame(|| {
-        let mut footer = div().flex_none().flex().flex_col();
-        if let Some(diagram) = diagram.as_ref() {
-            if !diagram.omitted.is_empty() || diagram.notice.is_some() {
-                let mut notes = div().px(px(metrics.page_pad)).py(px(8.)).flex().flex_col().gap(px(4.)).border_t_1().border_color(p.line).text_size(px(TypeScale::SM)).text_color(p.warn);
-                if let Some(notice) = &diagram.notice {
-                    notes = notes.child(SharedString::from(notice.clone()));
+            let mut footer = div().flex_none().flex().flex_col();
+            if let Some(diagram) = diagram.as_ref() {
+                if !diagram.omitted.is_empty() || diagram.notice.is_some() {
+                    let mut notes = div().px(px(metrics.page_pad)).py(px(Space::MD)).flex().flex_col().gap(px(Space::XS)).border_t_1().border_color(p.line).text_size(px(TypeScale::SM)).text_color(p.warn);
+                    if let Some(notice) = &diagram.notice {
+                        notes = notes.child(SharedString::from(notice.clone()));
+                    }
+                    for item in &diagram.omitted {
+                        notes = notes.child(SharedString::from(format!("{} · {} {}", i18n::text(locale, "diagram.omitted"), item.name, item.message)));
+                    }
+                    footer = footer.child(notes);
                 }
-                for item in &diagram.omitted {
-                    notes = notes.child(SharedString::from(format!("{} · {} {}", i18n::text(locale, "diagram.omitted"), item.name, item.message)));
+                let focus = hovered.as_deref().or(selected.as_deref());
+                for edge in &diagram.edges {
+                    let mark = if edge_hot(focus, edge) { "hot-wire" } else if focus.is_some() { "dim-wire" } else { "wire" };
+                    let label = SharedString::from(format!("{mark} {}.{} -> {}.{}", edge.from_table, edge.from_columns.join(", "), edge.to_table, edge.to_columns.join(", ")));
+                    footer = footer.child(div().id(SharedString::from(format!("diagram-wire:{}:{}:{}", edge.name, edge.from_table, edge.to_table))).hidden().aria_label(label));
                 }
-                footer = footer.child(notes);
             }
-            for edge in &diagram.edges {
-                let mark = if edge_hot(hovered.as_deref(), edge) { "hot-wire" } else if hovered.is_some() { "dim-wire" } else { "wire" };
-                let label = SharedString::from(format!("{mark} {}.{} -> {}.{}", edge.from_table, edge.from_columns.join(", "), edge.to_table, edge.to_columns.join(", ")));
-                footer = footer.child(div().id(SharedString::from(format!("diagram-wire:{}:{}:{}", edge.name, edge.from_table, edge.to_table))).hidden().aria_label(label));
-            }
-        }
-        footer.into_any_element()
+            footer.into_any_element()
         });
 
         stack_frame(|| {
-        div()
-            .id("diagram-pane")
-            .size_full()
-            .flex()
-            .flex_col()
-            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
-                // 键盘事件按“焦点元素 → 祖先”冒泡到这里：卡片自己先处理，菜单按钮、搜索框的也不误伤。
-                let key = event.keystroke.key.as_str();
-                if this.search_focused(window, cx) {
-                    if key == "escape" {
-                        this.clear_search();
+            div()
+                .id("diagram-pane")
+                .size_full()
+                .flex()
+                .flex_col()
+                .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                    // 键盘事件按“焦点元素 → 祖先”冒泡到这里：卡片自己先处理，菜单按钮、搜索框的也不误伤。
+                    let key = event.keystroke.key.as_str();
+                    if this.search_focused(window, cx) {
+                        if key == "escape" {
+                            this.clear_search();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    if this.pane_key(key) {
                         cx.stop_propagation();
                         cx.notify();
                     }
-                    return;
-                }
-                if this.pane_key(key) {
-                    cx.stop_propagation();
-                    cx.notify();
-                }
-            }))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                // 卡片菜单是页面里的一条菜单条，点其它位置（画布、页头、页脚）都要收起：
-                // 与启动器筛选浮层、导出抽屉一样，靠“点别处”关闭，不只靠 Esc 或再点一次卡片。
-                // 菜单条自己在按下事件上停了传播，所以菜单里的按钮不受这条路径影响。
-                if this.card_menu.take().is_some() {
-                    cx.notify();
-                }
-            }))
-            .child(header)
-            .child(body)
-            .child(footer)
-            .when(cfg!(test), |this| this.child(div().id("diagram-summary").hidden().child(SharedString::from(self.lines().join("\n")))))
+                }))
+                .child(header)
+                .child(body)
+                .child(footer)
+                .when(cfg!(test), |this| this.child(div().id("diagram-summary").hidden().child(SharedString::from(self.lines().join("\n")))))
         })
     }
 }

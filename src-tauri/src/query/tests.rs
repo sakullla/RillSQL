@@ -3266,3 +3266,30 @@ mod plan_join_model {
         assert_eq!(lines[1].node.node_kind(), NodeKind::Table);
     }
 }
+
+/// 外壳把已有查询标签改到另一条连接或另一个库（首页、对象树、历史再次打开）：编辑器跟上，
+/// 不停在第一次导入时的旧库上；外壳给的库为空时不清掉已经选好的库。
+#[test]
+fn desk_follows_the_shell_target_for_an_existing_tab() {
+    let mut desk = crate::query::desk::Desk::new();
+    let target = |connection: &str, database: &str| crate::query::desk::Target {
+        connection_id: connection.to_owned(),
+        connection_name: connection.to_owned(),
+        database: database.to_owned(),
+        engine: "mysql".to_owned(),
+        schema: String::new(),
+        environment: String::new(),
+        server_version: None,
+    };
+    desk.import_tab("a", "select 1", Some(target("dev", "shop")));
+    desk.focus_tab(Some("a"));
+    assert!(!desk.follow_target("a", Some(target("dev", "shop"))), "相同目标不算变化");
+    assert!(desk.follow_target("a", Some(target("dev", "crm"))));
+    assert_eq!(desk.target().map(|t| t.database), Some("crm".to_owned()));
+    assert!(!desk.follow_target("a", Some(target("dev", ""))), "外壳没给库时保留已选的库");
+    assert_eq!(desk.target().map(|t| t.database), Some("crm".to_owned()));
+    assert!(desk.follow_target("a", Some(target("uat", ""))), "换连接时一定跟上");
+    let now = desk.target().unwrap();
+    assert_eq!((now.connection_id.as_str(), now.database.as_str()), ("uat", ""));
+    assert!(!desk.follow_target("a", None), "外壳没有目标时不动");
+}

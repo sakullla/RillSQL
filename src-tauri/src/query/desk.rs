@@ -430,6 +430,42 @@ impl Desk {
         self.tabs.iter().map(|tab| tab.id.clone()).collect()
     }
 
+    /// 外壳改了已有查询标签的连接或库（从首页/对象树/历史再次打开、续接动作补上库）：
+    /// 编辑器跟上外壳，不再停在旧库上。外壳没给出连接、或给的库为空时不动现有目标。
+    pub fn follow_target(&mut self, id: &str, target: Option<Target>) -> bool {
+        let Some(next) = target.filter(|target| !target.connection_id.is_empty()) else {
+            return false;
+        };
+        let Some(tab) = self.tab_mut(id) else {
+            return false;
+        };
+        let changed = match tab.target.as_ref() {
+            None => true,
+            Some(current) => {
+                current.connection_id != next.connection_id
+                    || (!next.database.is_empty() && current.database != next.database)
+            }
+        };
+        if !changed {
+            return false;
+        }
+        let same = tab.target.as_ref().filter(|current| current.connection_id == next.connection_id);
+        let environment = same.map(|current| current.environment.clone()).unwrap_or_default();
+        let server_version = same.and_then(|current| current.server_version.clone());
+        let database = next.database.clone();
+        tab.target = Some(Target { environment, schema: String::new(), server_version, ..next });
+        if tab.target.as_ref().is_some_and(|target| target.environment.is_empty()) {
+            let connection = tab.target.as_ref().map(|target| target.connection_id.clone()).unwrap_or_default();
+            let environment = self.environment_of(&connection);
+            if let Some(target) = self.tab_mut(id).and_then(|tab| tab.target.as_mut()) {
+                target.environment = environment;
+            }
+        }
+        self.remember_database(&database);
+        self.view_gen = self.view_gen.saturating_add(1);
+        true
+    }
+
     pub fn import_tab(&mut self, id: &str, draft: &str, target: Option<Target>) {
         if self.has_tab(id) {
             if let Some(tab) = self.tab_mut(id) {

@@ -3798,6 +3798,17 @@ impl Workbench {
         self.open_diagram_target(open);
     }
 
+    /// 关系图卡片上的右键/菜单键：在指针处弹出表级菜单（与对象树同一册）。
+    fn consume_diagram_menu(&mut self, cx: &mut Context<Self>) {
+        let Some((open, at)) = self.diagram.update(cx, |pane, _| pane.take_menu()) else { return };
+        if let Some(at) = at {
+            self.menu_at = at;
+        }
+        if self.model.open_diagram_menu(&open.connection_id, &open.database, &open.schema, &open.table) {
+            cx.notify();
+        }
+    }
+
     fn open_diagram_target(&mut self, open: DiagramOpen) {
         let row = self.model.connections.rows.iter().find(|row| row.saved.id == open.connection_id);
         let name = row.map(|row| row.saved.name.clone()).unwrap_or_else(|| open.connection_id.clone());
@@ -4028,6 +4039,7 @@ impl Workbench {
         self.ensure_diagram(cx);
         self.consume_pending_create(cx);
         self.consume_diagram_open(cx);
+        self.consume_diagram_menu(cx);
         self.consume_diagram_back(cx);
         self.sync_grid_flags(cx);
         self.refresh_exchange(cx);

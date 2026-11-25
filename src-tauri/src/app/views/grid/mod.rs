@@ -5052,7 +5052,8 @@ impl GridPane {
                 });
             })
             .flex_none()
-            .h(px(m.strip_h()))
+            // 查找框是一整个输入控件（含聚焦光环），细条高度放不下会被上下裁掉：取区块标题栏的高度。
+            .h(px(m.bar_h().max(m.control_h + Space::SM)))
             .px(px(Space::MD))
             .flex()
             .items_center()

@@ -71,6 +71,36 @@ impl BrowseColumns {
         Self { widths, default: false, comment: true }
     }
 
+    /// 注释列是字段表里最长的文字：宽窗口里名称列只留到“最长字段名 + 标记”够用的宽度，
+    /// 其余空余都给注释，不再在名称和类型之间留一大片空白、注释却被截断。
+    pub fn widen_comment(&mut self, content_w: f32, name_w: f32) {
+        if !self.comment || content_w <= 0. {
+            return;
+        }
+        let mut fixed = self.widths.kind + self.widths.nullable + self.widths.drop + FieldWidths::PAD_LEFT + FieldWidths::PAD_RIGHT;
+        let mut gaps = 4usize;
+        if self.default {
+            fixed += self.widths.default;
+            gaps += 1;
+        }
+        let room = content_w - fixed - gaps as f32 * FieldWidths::GAP;
+        let name = name_w.clamp(Self::NAME_MIN, Self::NAME_MAX).max(self.widths.name_min);
+        let comment = (room - name).clamp(self.widths.comment, Self::COMMENT_MAX);
+        self.widths.comment = comment;
+    }
+
+    pub const NAME_MIN: f32 = 180.;
+    pub const NAME_MAX: f32 = 340.;
+    pub const COMMENT_MAX: f32 = 720.;
+
+    /// 名称列所需宽度的估算：最长的字段名（全角字符按两倍宽）加上标记槽与徽标。
+    pub fn name_width<'a>(names: impl Iterator<Item = &'a str>) -> f32 {
+        let longest = names
+            .map(|name| name.chars().map(|ch| if ch.is_ascii() { 7.4 } else { 13.5 }).sum::<f32>())
+            .fold(0f32, f32::max);
+        longest + NAME_INSET + 72.
+    }
+
     /// 有列因为宽度不够被隐藏（工具条显示“显示全部列”开关）。
     pub fn hides_any(content_w: f32) -> bool {
         let all = Self::of(content_w, false);
@@ -643,6 +673,7 @@ impl StructurePane {
         let mut mark = mark;
         let mut revert_btn = revert_btn;
         let mut drop_btn = Some(drop_btn);
+        let row_group = SharedString::from(format!("structure-row-group-{index}"));
         let mut cells: Vec<AnyElement> = Vec::new();
         for (cell, width) in row_cells(&cols, marks) {
             let frame = cell_frame(width);
@@ -665,7 +696,7 @@ impl StructurePane {
                         div()
                             .id(SharedString::from(format!("structure-col-name-{index}")))
                             .test_support()
-                            .flex_1()
+                            // 不撑满：主键序号、自增、索引标记紧跟在名字后面，而不是被推到列的最右边。
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::MEDIUM)
@@ -736,6 +767,11 @@ impl StructurePane {
                     .items_center()
                     .justify_end()
                     .gap(px(Space::XXS))
+                    // 干净的行只在悬停/选中时露出删除按钮：几十行的垃圾桶不再常驻成一条噪声。
+                    // 改过、删过的行（还原/撤销按钮）始终可见。
+                    .when(change == ColumnChange::Clean && self.focused_row != Some(index), |this| {
+                        this.opacity(0.).group_hover(row_group.clone(), |style| style.opacity(1.))
+                    })
                     .when_some(revert_btn.take(), |this, btn| this.child(btn))
                     .when_some(drop_btn.take(), |this, btn| this.child(btn))
                     .into_any_element(),
@@ -747,6 +783,7 @@ impl StructurePane {
         div()
             .id(SharedString::from(format!("structure-row-columns-{index}")))
             .test_support()
+            .group(row_group)
             .role(gpui_kit::Role::Row)
             .aria_label(SharedString::from(column.name.clone()))
             .aria_selected(is_focused)

@@ -1748,6 +1748,14 @@ dict! {
     "diagram.search" => "搜索表", "Search tables";
     "diagram.openData" => "打开表数据", "Open table data";
     "diagram.openStructure" => "查看表结构", "View table structure";
+    "diagram.zoom.resetHint" => "恢复 100%（0）", "Reset to 100% (0)";
+    "diagram.layoutReset" => "重排布局", "Reset layout";
+    "diagram.stats" => "{tables} 张表 · {keys} 个外键", "{tables} tables · {keys} foreign keys";
+    "diagram.moreColumns" => "还有 {count} 列，展开", "{count} more columns";
+    "diagram.collapseColumns" => "收起", "Collapse";
+    "diagram.menu.related" => "在图中定位并高亮关联", "Locate and highlight relations";
+    "diagram.menu.toggleColumns" => "展开/折叠列", "Expand/collapse columns";
+    "diagram.hint" => "拖动卡片排布局 · 拖动空白或滚动平移 · ⌘/Ctrl+滚轮缩放 · 右键表操作 · 双击打开数据", "Drag cards to arrange · Drag blank space or scroll to pan · ⌘/Ctrl+wheel to zoom · Right-click for table actions · Double-click to open data";
     "connections.filter.engine" => "按引擎筛选", "Filter by engine";
     "connections.filter.env" => "按环境筛选", "Filter by environment";
     "connections.filter.clear" => "清除筛选", "Clear filters";
@@ -2276,6 +2284,10 @@ dict! {
     "structure.field.badgeFk" => "外键 → {target}", "FK → {target}";
     "structure.field.changedFrom" => "原定义：{detail}", "Original: {detail}";
     "structure.field.presets" => "常用字段", "Presets";
+    "structure.hint.edit" => "编辑字段", "Edit column";
+    "structure.hint.delete" => "标记删除", "Mark for removal";
+    "structure.hint.preview" => "预览 SQL", "Preview SQL";
+    "structure.hint.more" => "右键查看更多操作", "Right-click for more";
     "structure.preset.timestamps" => "时间戳（created_at / updated_at）", "Timestamps (created_at / updated_at)";
     "structure.preset.softDelete" => "软删除（deleted_at）", "Soft delete (deleted_at)";
     "structure.preset.statusRemark" => "状态与备注（status / remark）", "Status & remark (status / remark)";

@@ -2568,6 +2568,28 @@ impl WorkbenchModel {
         true
     }
 
+    /// 关系图里一张表的右键菜单：对象树里已有这张表就用同一册表级菜单（打开数据、结构、新建查询、
+    /// DDL、模板、重命名/清空/删除等），否则给只读的那几项。末尾都加上关系图自己的动作。
+    pub fn open_diagram_menu(&mut self, connection_id: &str, database: &str, schema: &str, table: &str) -> bool {
+        use crate::catalog::model::ObjectKind;
+        let node = [ObjectKind::Table, ObjectKind::View]
+            .iter()
+            .find_map(|kind| self.nav.object_by_key(connection_id, database, schema, table, *kind))
+            .map(|node| node.id.clone());
+        let opened = match node {
+            Some(node) => self.open_nav_menu(&node),
+            None => {
+                self.open_menu(MenuPlace::ObjectTree, MenuTarget::Object);
+                self.menu = Some(OpenMenu::with_items(MenuPlace::ObjectTree, super::menus::diagram_fallback_items(table)));
+                true
+            }
+        };
+        if let Some(menu) = self.menu.as_mut() {
+            menu.items.extend(super::menus::diagram_extra_items(table));
+        }
+        opened
+    }
+
     pub fn open_connection_menu(&mut self) {
         self.open_menu(MenuPlace::ConnectionRow, MenuTarget::Connection);
         let connected = self
@@ -5392,6 +5414,17 @@ impl WorkbenchModel {
             });
             match node.filter(|(connection_id, ..)| !connection_id.is_empty()) {
                 Some((connection_id, connection_name, database, engine)) => {
+                    // 连接行没有库：用这条连接的默认库，而不是空库。
+                    let database = if database.is_empty() {
+                        self.connections
+                            .rows
+                            .iter()
+                            .find(|row| row.saved.id == connection_id)
+                            .and_then(|row| self.default_query_database(&row.saved))
+                            .unwrap_or_default()
+                    } else {
+                        database
+                    };
                     self.open_bound_query(
                         String::new(),
                         Some(connection_id),
@@ -6927,6 +6960,13 @@ impl WorkbenchModel {
 
     fn default_query_database(&self, saved: &SavedConnection) -> Option<String> {
         saved.database.clone().filter(|db| !db.is_empty())
+            // 没配默认库时，对象树里正选着这条连接下的某个库（或它里面的对象）就用那个库。
+            .or_else(|| {
+                self.nav
+                    .focus_node()
+                    .filter(|node| node.connection_id == saved.id && !node.stale && !node.database.is_empty())
+                    .map(|node| node.database.clone())
+            })
             .or_else(|| Some(crate::adapters::adapter(saved.engine).meta().default_database().to_owned()).filter(|db| !db.is_empty()))
             .or_else(|| self.only_database(&saved.id))
     }

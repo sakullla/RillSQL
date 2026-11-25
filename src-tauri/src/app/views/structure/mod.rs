@@ -2880,7 +2880,32 @@ impl StructurePane {
                     .border_t_1()
                     .border_color(p.line_soft)
                     .bg(p.surface)
-                    .child(div().id("structure-browse-hint").test_support().flex_1().min_w_0().child(kit::muted(t("structure.columns.browseHint"), p)))
+                    // 操作提示写成键位 + 短语，一眼能扫到，不再是一整句说明文。
+                    .child({
+                        let key = |label: &str, text: &str| {
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(kit::Space::XS))
+                                .child(kit::kbd(kit::shortcut(label), p))
+                                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t(text)))
+                        };
+                        div()
+                            .id("structure-browse-hint")
+                            .test_support()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(kit::Space::LG))
+                            .tooltip_text(t("structure.columns.browseHint"))
+                            .child(key("Enter", "structure.hint.edit"))
+                            .child(key("Delete", "structure.hint.delete"))
+                            .child(key("Mod+Enter", "structure.hint.preview"))
+                            .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(t("structure.hint.more")))
+                    })
                     .into_any_element(),
             );
         }
@@ -3683,7 +3708,11 @@ impl StructurePane {
         let content_w = (self.content_width - 2. * metrics.page_pad).max(0.);
         let widths = FieldWidths::of(content_w, create).with_comment(content_w, create && self.shows_column_comments());
         let mut editor = div().flex().flex_col().gap(px(metrics.section_gap()));
-        let browse_cols = browse::BrowseColumns::of(content_w, self.show_all_columns);
+        let mut browse_cols = browse::BrowseColumns::of(content_w, self.show_all_columns);
+        if !create && !self.show_all_columns {
+            let name_w = browse::BrowseColumns::name_width(self.session.kept_columns.iter().map(|column| column.name.as_str()));
+            browse_cols.widen_comment(content_w, name_w);
+        }
         let hides_columns = !create && (self.show_all_columns || browse::BrowseColumns::hides_any(content_w));
 
         let mut toolbar_has_presets = false;

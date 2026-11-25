@@ -152,6 +152,8 @@ pub struct ExchangePane {
     loaded_control: Option<(String, Arc<crate::export::ExportControl>)>,
     dump_request: Option<DumpRequest>,
     migrate_request: Option<MigrateRequest>,
+    /// 上一次成功选择的保存目录；下次导出从这里开始。
+    last_dir: Option<PathBuf>,
     pub notice: String,
     /// 来源切换由外壳决定工作项与来源，面板只把请求交回 Workbench。
     owner: Option<gpui_kit::WeakEntity<crate::app::shell::Workbench>>,
@@ -200,6 +202,7 @@ impl ExchangePane {
             loaded_control: None,
             dump_request: None,
             migrate_request: None,
+            last_dir: None,
             notice: String::new(),
             owner: None,
         }
@@ -566,12 +569,8 @@ impl ExchangePane {
                 return;
             }
         }
-        let suggested = match kind {
-            SaveKind::Loaded => format!("loaded.{}", extension_of(&self.format_name)),
-            SaveKind::Full => format!("full.{}", extension_of(&self.format_name)),
-            SaveKind::Dump => "dump.sql".to_owned(),
-        };
-        let directory = std::env::temp_dir();
+        let suggested = suggested_file_name(&self.source, kind, &self.format_name, chrono::Local::now());
+        let directory = export_dir(self.last_dir.as_deref());
         let receiver = cx.prompt_for_new_path(&directory, Some(&suggested));
         cx.spawn(async move |this, cx| {
             let message = receiver.await;
@@ -590,7 +589,10 @@ impl ExchangePane {
     ) {
         let path = match message {
             Ok(Ok(Some(path))) => match crate::app::accept_save_path(&path) {
-                Ok(path) => path,
+                Ok(path) => {
+                    self.last_dir = path.parent().filter(|dir| dir.is_dir()).map(PathBuf::from);
+                    path
+                }
                 Err(error) => {
                     let (id, kind) = save_slot(kind);
                     self.fail_open(id, kind, error);
@@ -1747,6 +1749,57 @@ fn save_slot(kind: SaveKind) -> (&'static str, &'static str) {
     }
 }
 
+/// 保存对话框的起始目录：上次导出的目录 → 下载 → 文稿/主目录。不再落到临时目录。
+fn export_dir(last: Option<&std::path::Path>) -> PathBuf {
+    if let Some(dir) = last.filter(|dir| dir.is_dir()) {
+        return dir.to_path_buf();
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from) {
+        let downloads = home.join("Downloads");
+        if downloads.is_dir() {
+            return downloads;
+        }
+    }
+    crate::app::views::query::default_save_dir(None)
+}
+
+/// 文件名里不能出现的字符换成下划线，去掉首尾的点与空白。
+fn file_safe(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|ch| if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { ch })
+        .collect();
+    cleaned.trim().trim_matches('.').trim().chars().take(80).collect()
+}
+
+/// 按来源自动生成导出文件名：表名/库名 + 时间戳，重复导出不会覆盖上一份。
+fn suggested_file_name(source: &ExchangeSource, kind: SaveKind, format: &str, now: chrono::DateTime<chrono::Local>) -> String {
+    let stamp = now.format("%Y%m%d_%H%M%S");
+    let table = source.table.as_ref();
+    let base = match kind {
+        SaveKind::Dump => table.map(|table| table.database.as_str()).filter(|name| !name.is_empty()).map(file_safe).unwrap_or_default(),
+        SaveKind::Full | SaveKind::Loaded if source.kind.is_query() => String::new(),
+        SaveKind::Full | SaveKind::Loaded => table
+            .map(|table| {
+                let name = file_safe(&table.table);
+                // 筛选后的导出带上标记，和整表导出区分开。
+                if source.condition.narrowing() && !name.is_empty() { format!("{name}_filtered") } else { name }
+            })
+            .unwrap_or_default(),
+    };
+    let base = if base.is_empty() {
+        match kind {
+            SaveKind::Dump => "dump".to_owned(),
+            _ if source.kind.is_query() => "query_result".to_owned(),
+            _ => "export".to_owned(),
+        }
+    } else {
+        base
+    };
+    let extension = if matches!(kind, SaveKind::Dump) { "sql" } else { extension_of(format) };
+    format!("{base}_{stamp}.{extension}")
+}
+
 fn extension_of(format: &str) -> &'static str {
     match format {
         "json" => "json",
@@ -1815,6 +1868,35 @@ pub fn migrate_request(id: &str, source: MigrateTableRef, target: MigrateTableRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 导出文件名按来源自动生成：表名/库名 + 时间戳，不再是固定的 full / loaded / dump。
+    #[test]
+    fn suggested_names_follow_the_source() {
+        use chrono::TimeZone;
+        let now = chrono::Local.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let mut source = ExchangeSource {
+            kind: ExchangeSourceKind::Table,
+            table: Some(TableRef {
+                connection_id: "c".into(),
+                database: "shop".into(),
+                schema: String::new(),
+                table: "orders".into(),
+                engine: "mysql".into(),
+                include_foreign_keys: false,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(suggested_file_name(&source, SaveKind::Full, "csv", now), "orders_20260102_030405.csv");
+        assert_eq!(suggested_file_name(&source, SaveKind::Loaded, "xlsx", now), "orders_20260102_030405.xlsx");
+        assert_eq!(suggested_file_name(&source, SaveKind::Dump, "csv", now), "shop_20260102_030405.sql");
+        source.condition.search = Some("x".into());
+        assert_eq!(suggested_file_name(&source, SaveKind::Full, "json", now), "orders_filtered_20260102_030405.json");
+        source.table.as_mut().unwrap().table = "a/b:c".into();
+        source.condition = Default::default();
+        assert_eq!(suggested_file_name(&source, SaveKind::Full, "markdown", now), "a_b_c_20260102_030405.md");
+        let query = ExchangeSource { kind: ExchangeSourceKind::Query, ..Default::default() };
+        assert_eq!(suggested_file_name(&query, SaveKind::Loaded, "csv", now), "query_result_20260102_030405.csv");
+    }
 
     fn exchange_pane() -> ExchangePane {
         ExchangePane::new(Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(std::env::temp_dir().join(format!(

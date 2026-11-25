@@ -3667,18 +3667,13 @@ impl Workbench {
                             this.perform("menu-connection", cx);
                         }))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            // 查询标签立即绑定这条连接与它的默认库；未连接时后台建连。
+                            // 不再等连上后重放“在此处新建查询”：那会读对象树上其它连接的焦点行。
                             this.model.connections.selected = Some(open_id.clone());
-                            if this.model.connections.row_status(&open_id) == LinkStatus::Connected {
-                                this.perform("conn-new-query", cx);
-                            } else {
+                            if this.model.connections.row_status(&open_id) != LinkStatus::Connected {
                                 this.model.expand_nav_connection(&open_id);
-                                this.model.queue_connect(super::conn_modal::ConnectIntent::new(
-                                    open_id.clone(),
-                                    super::conn_modal::ConnectAction::NewQuery,
-                                    None,
-                                ));
-                                cx.notify();
                             }
+                            this.perform("conn-new-query", cx);
                         })),
                 );
             }
