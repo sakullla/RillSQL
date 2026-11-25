@@ -58,6 +58,8 @@ pub enum JobDone {
     VaultMigrateAll(TaskToken, Result<crate::connections::secrets::MigrationReport, crate::connections::secrets::VaultFailure>),
     /// 修订 6：“不再迁移”清掉的标记数。
     VaultDismissed(TaskToken, Result<usize, crate::connections::secrets::VaultFailure>),
+    /// 修订 6：打开设置安全卡片时加载保险库的结果（待迁入数量随之可知）。
+    VaultLoaded(TaskToken, Result<(), crate::connections::secrets::VaultFailure>),
 }
 
 pub fn runtime() -> &'static tokio::runtime::Runtime {
@@ -222,6 +224,7 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
         PendingJob::RetryVaultMigration => JobDone::VaultRetry(token, services.connections.retry_failed_migration().await),
         PendingJob::MigrateAllLegacy => JobDone::VaultMigrateAll(token, services.connections.migrate_all_legacy().await),
         PendingJob::DismissLegacy => JobDone::VaultDismissed(token, services.connections.dismiss_legacy().await),
+        PendingJob::LoadVault => JobDone::VaultLoaded(token, services.connections.load_secret_vault().await),
         PendingJob::GroupOp => {
             let Some(op) = request.group else {
                 return JobDone::Notice(token, Err("ui.group.new".into()));
@@ -325,7 +328,13 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                     model.notice_detail.clear();
                 }
             } else {
-                model.vault_alert.migrating_all = false;
+                model.vault_alert.dismissing = false;
+            }
+        }
+        JobDone::VaultLoaded(token, result) => {
+            // 待迁入数量已在上面随元数据更新；这里只记下加载失败。
+            if accepted(services, owner, token) {
+                model.vault_alert.apply_load(result);
             }
         }
         JobDone::VaultRetry(token, result) => {

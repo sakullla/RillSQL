@@ -982,6 +982,25 @@ impl Service {
 
     /// 仍未迁入保险库的旧条目（凭据账户、原因）。
     #[allow(dead_code)] // 界面只用保险库排出的事件，不为显示提示条而加载保险库（会触发钥匙串授权）。
+    /// 修订 6：打开设置安全卡片时加载保险库，让待迁入数量可知。只读主密钥一次，不读任何旧条目；
+    /// 已加载时不再访问钥匙串。失败分类与重试相同。
+    pub async fn load_secret_vault(&self) -> Result<(), VaultFailure> {
+        self.store()
+            .await
+            .map_err(|reason| VaultFailure { problem: VaultProblem::Internal, reason })?;
+        match self.secrets.migration_failures() {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                self.log(format!("加载保险库失败：{err}"));
+                match err.vault_failure() {
+                    Some(failure) => Err(failure),
+                    // 损坏已由事件报告，保险库从空库继续：加载本身算成功。
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+
     pub async fn secret_migration_failures(&self) -> Result<Vec<(String, String)>, String> {
         self.store().await?;
         self.secrets.migration_failures().map_err(|err| err.guidance())

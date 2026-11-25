@@ -452,6 +452,8 @@ pub enum PendingJob {
     MigrateAllLegacy,
     /// 修订 6：设置页“不再迁移”：只清除待迁移标记。
     DismissLegacy,
+    /// 打开设置安全卡片且还不知道待迁入数量：加载一次保险库（只读主密钥，不读旧条目）。
+    LoadVault,
     /// 一次分组命令：新建/重命名、删除、归组、折叠。
     GroupOp,
 }
@@ -514,8 +516,12 @@ pub struct VaultAlert {
     pub retrying: bool,
     /// 修订 6：名单里还没迁入的旧密码数；只来自已加载保险库的元数据（不访问钥匙串），没加载时为 None。
     pub pending: Option<usize>,
-    /// 修订 6：“现在全部迁入”或“不再迁移”在途。
+    /// 修订 6：“现在全部迁入”在途。
     pub migrating_all: bool,
+    /// 修订 6：“不再迁移”在途（与全部迁入分开，各自的按钮各自显示忙碌）。
+    pub dismissing: bool,
+    /// 打开设置安全卡片时为显示待迁入数量加载保险库（只读主密钥一次）：已排过就不再排。
+    pub load_requested: bool,
     /// 用户收起了提示条；有新的事件时重新出现。
     pub dismissed: bool,
 }
@@ -538,14 +544,38 @@ impl VaultAlert {
         if self.failed.is_empty() { "ui.vault.retryPlain" } else { "ui.vault.retry" }
     }
 
-    /// 修订 6：设置页要不要显示“旧密码待迁入”一行（全部迁入 / 不再迁移）。
+    /// 修订 6：名单里还没迁入的旧密码数（不含迁入失败的）。
     pub fn pending_count(&self) -> usize {
         self.pending.unwrap_or(0)
     }
 
+    /// 修订 6：设置页要不要显示“旧密码迁移”一行：还有待迁入的，或还有迁入失败的。
+    /// 只剩失败条目时也要显示，“不再迁移”必须仍然可达（它同样会让失败条目不再迁移）。
+    pub fn shows_legacy_row(&self) -> bool {
+        self.pending_count() > 0 || !self.failed.is_empty()
+    }
+
+    /// 重试、全部迁入、不再迁移任一在途：这三个按钮都不可点。
+    pub fn busy(&self) -> bool {
+        self.retrying || self.migrating_all || self.dismissing
+    }
+
+    /// 打开设置安全卡片时要不要加载保险库来显示待迁入数量：还不知道数量、没排过、也没有已知的加载问题。
+    pub fn needs_count_load(&self) -> bool {
+        self.pending.is_none() && !self.load_requested && self.load_problem.is_none()
+    }
+
+    /// 安全卡片触发的保险库加载结果：失败时记下加载问题，状态行显示既有的加载失败文字。
+    pub fn apply_load(&mut self, result: Result<(), crate::connections::secrets::VaultFailure>) {
+        if let Err(failure) = result {
+            self.load_problem = Some(failure);
+            self.dismissed = false;
+        }
+    }
+
     /// 修订 6：“不再迁移”的结果：失败清单也一并清掉（它们同样不再迁移）。
     pub fn apply_dismiss(&mut self, result: Result<usize, crate::connections::secrets::VaultFailure>) {
-        self.migrating_all = false;
+        self.dismissing = false;
         match result {
             Ok(_) => {
                 self.failed.clear();
@@ -1070,6 +1100,26 @@ impl WorkbenchModel {
     }
 
     pub fn dispatch(&mut self, id: &str) -> Option<Effect> {
+        let effect = self.dispatch_command(id);
+        if effect.is_some() {
+            self.load_vault_for_security_card();
+        }
+        effect
+    }
+
+    /// 修订 6：设置安全卡片（“本地”分区）打开时还不知道待迁入数量，就加载一次保险库。
+    /// 只读主密钥一次（用户主动打开了安全设置），不读任何旧条目；每次运行只排一次。
+    fn load_vault_for_security_card(&mut self) {
+        if self.shell.page == AppPage::Settings
+            && self.settings_section == crate::app::views::settings::SettingsSection::Local
+            && self.vault_alert.needs_count_load()
+        {
+            self.vault_alert.load_requested = true;
+            self.enqueue(PendingJob::LoadVault);
+        }
+    }
+
+    fn dispatch_command(&mut self, id: &str) -> Option<Effect> {
         self.commands.push(id.to_owned());
         if self.close_prompt.is_some() && !matches!(id, "close-stay" | "close-leave") {
             return Some(Effect::None);
@@ -2121,7 +2171,11 @@ impl WorkbenchModel {
         if matches!(&job, PendingJob::RefreshHistory) {
             self.history.begin_load();
         }
-        self.running_jobs = self.running_jobs.saturating_add(1);
+        // 安全卡片自动发起的保险库加载不算在途工作：它和更新卡片同在“本地”分区，
+        // 等钥匙串授权时不能挡住安装更新或关闭窗口。
+        if !matches!(&job, PendingJob::LoadVault) {
+            self.running_jobs = self.running_jobs.saturating_add(1);
+        }
         self.pending.push_back(job);
     }
 
@@ -4354,20 +4408,20 @@ impl WorkbenchModel {
     fn vault_command(&mut self, id: &str) -> bool {
         match id {
             "vault-retry-migration" => {
-                if !self.vault_alert.retrying && !self.vault_alert.migrating_all {
+                if !self.vault_alert.busy() {
                     self.vault_alert.retrying = true;
                     self.enqueue(PendingJob::RetryVaultMigration);
                 }
             }
             "vault-migrate-all" => {
-                if !self.vault_alert.migrating_all && !self.vault_alert.retrying {
+                if !self.vault_alert.busy() {
                     self.vault_alert.migrating_all = true;
                     self.enqueue(PendingJob::MigrateAllLegacy);
                 }
             }
             "vault-dismiss-legacy" => {
-                if !self.vault_alert.migrating_all && !self.vault_alert.retrying {
-                    self.vault_alert.migrating_all = true;
+                if !self.vault_alert.busy() {
+                    self.vault_alert.dismissing = true;
                     self.enqueue(PendingJob::DismissLegacy);
                 }
             }

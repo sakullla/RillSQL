@@ -1897,6 +1897,7 @@ dict! {
     "ui.vault.legacyDismissed" => "不再迁移旧密码，用到这些连接时请重新输入密码", "Old passwords will no longer be moved; re-enter them when those connections need one";
     "ui.settings.legacyTitle" => "旧密码迁移", "Old saved passwords";
     "ui.settings.legacyPending" => "还有 {n} 个旧密码未迁入本地保险库，用到对应连接时会自动迁入。点“现在全部迁入”时，macOS 可能对每一条各询问一次授权；也可以选择不再迁移，之后用到这些连接时重新输入密码。", "{n} old saved passwords have not moved into the local vault yet; each moves automatically the first time its connection needs it. \"Move all now\" may make macOS ask once per entry. You can also stop moving them and re-enter those passwords when needed.";
+    "ui.settings.legacyFailed" => "还有 {n} 个旧密码没能迁入。可以再试一次全部迁入，也可以选择不再迁移，之后用到这些连接时重新输入密码，不会再逐条询问授权。", "{n} old saved passwords could not be moved. You can try \"Move all now\" again, or stop moving them and re-enter those passwords when needed, without further keychain prompts.";
     "ui.settings.legacyMigrateAll" => "现在全部迁入", "Move all now";
     "ui.settings.legacyDismiss" => "不再迁移", "Stop moving";
     "history.page.loading" => "正在读取历史…", "Reading history…";

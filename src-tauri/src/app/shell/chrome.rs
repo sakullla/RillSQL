@@ -6904,9 +6904,9 @@ impl Workbench {
                         (self.t("ui.settings.vaultStatus"), Some(status_hint), retry),
                     ];
                     // 修订 6：旧密码按需迁入；这里给出待迁入数量（只看本地元数据），可以全部迁入或不再迁移。
-                    let pending = alert.pending_count();
-                    if pending > 0 {
-                        let busy = alert.migrating_all || alert.retrying;
+                    // 只剩迁入失败的条目时也显示：“不再迁移”要一直可达，免得只能逐条重试。
+                    if alert.shows_legacy_row() {
+                        let busy = alert.busy();
                         let actions = div()
                             .flex()
                             .flex_wrap()
@@ -6919,12 +6919,13 @@ impl Workbench {
                             )
                             .child(
                                 kit::tool_button("vault-dismiss-legacy", None, self.t("ui.settings.legacyDismiss"), act("vault-dismiss-legacy", cx))
+                                    .loading(alert.dismissing)
                                     .disabled(busy)
                                     .small(),
                             );
                         rows.push((
                             self.t("ui.settings.legacyTitle"),
-                            Some(SharedString::from(legacy_pending_line(pending, |key| self.model.text(key)))),
+                            Some(SharedString::from(legacy_pending_line(alert, |key| self.model.text(key)))),
                             actions.into_any_element(),
                         ));
                     }
@@ -9354,6 +9355,14 @@ pub(super) fn vault_alert_lines(alert: &super::model::VaultAlert, text: impl Fn(
 }
 
 /// 修订 6：设置页“旧密码待迁入”的说明文字（含 macOS 可能逐条询问授权的提醒）。
-pub(super) fn legacy_pending_line(pending: usize, text: impl Fn(&str) -> String) -> String {
-    i18n::fill(&text("ui.settings.legacyPending"), &[("n", &pending.to_string())])
+pub(super) fn legacy_pending_line(alert: &super::model::VaultAlert, text: impl Fn(&str) -> String) -> String {
+    let mut parts = Vec::new();
+    let pending = alert.pending_count();
+    if pending > 0 {
+        parts.push(i18n::fill(&text("ui.settings.legacyPending"), &[("n", &pending.to_string())]));
+    }
+    if !alert.failed.is_empty() {
+        parts.push(i18n::fill(&text("ui.settings.legacyFailed"), &[("n", &alert.failed.len().to_string())]));
+    }
+    parts.join("\n")
 }

@@ -3095,6 +3095,8 @@ impl Workbench {
             // 分组用自己的任务板：分组的读写不能顶掉正在读取的连接列表。
             PendingJob::RefreshGroups | PendingJob::GroupOp => "groups",
             PendingJob::RetryVaultMigration | PendingJob::MigrateAllLegacy | PendingJob::DismissLegacy => "vault",
+            // 安全卡片的保险库加载用自己的任务板：不顶掉进行中的迁入、重试或不再迁移。
+            PendingJob::LoadVault => "vault-load",
             PendingJob::ReadProfiles(..) | PendingJob::SaveProfiles(_) => "profile-import",
             _ => "connections",
         };
@@ -3126,7 +3128,10 @@ impl Workbench {
                                 this.pump_jobs(cx);
                             }
                         }
-                        this.model.finish_job();
+                        // 安全卡片的保险库加载排队时没有计入在途工作（见 enqueue）。
+                        if owner != "vault-load" {
+                            this.model.finish_job();
+                        }
                         this.persist_if_needed(cx);
                         cx.notify();
                     })

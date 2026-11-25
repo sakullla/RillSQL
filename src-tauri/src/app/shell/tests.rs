@@ -15823,7 +15823,7 @@ async fn vault_migration_failure_surfaces_in_the_ui_and_retry_calls_the_service(
     // 修订 6：设置页显示待迁入数量（只看本地元数据），点“现在全部迁入”。
     assert_eq!(model.vault_alert.pending, Some(1));
     assert!(!model.vault_alert.visible(), "待迁入不是问题，不弹提示条");
-    let line = super::chrome::legacy_pending_line(model.vault_alert.pending_count(), |key| model.text(key));
+    let line = super::chrome::legacy_pending_line(&model.vault_alert, |key| model.text(key));
     assert!(line.contains('1') && line.contains("macOS"), "{line}");
     let _ = model.dispatch("vault-migrate-all");
     assert!(model.vault_alert.migrating_all);
@@ -15895,6 +15895,164 @@ async fn vault_dismiss_legacy_clears_pending_marks_through_the_service() {
     assert_eq!(model.notice_key, Some("ui.vault.legacyDismissed"));
     assert_eq!(legacy.reads.load(std::sync::atomic::Ordering::SeqCst), 0, "不再迁移不读旧条目");
     assert_eq!(legacy.inner.dump().len(), 1, "旧条目以外的数据都不删，旧条目本身也原样保留");
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 修订 6 复审：全部迁入被拒后只剩失败条目（待迁入为 0），设置页仍显示旧密码一行，
+/// “不再迁移”仍可点，点后失败条目退役、一行消失，且不再读旧条目。不再迁移有自己的忙碌标记，
+/// 任一操作在途时重试、全部迁入、不再迁移都不再派发。
+#[tokio::test]
+async fn dismiss_stays_reachable_after_migrate_all_is_denied() {
+    let dir = std::env::temp_dir().join(format!("rillsql-vault-denied-dismiss-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("connections.sqlite");
+    let legacy = Arc::new(DenyingKeychain::default());
+    let old = AppServices::new(Arc::new(Service::new(config.clone(), legacy.clone())));
+    let mut draft = sample_draft(Engine::Mysql);
+    draft.save_password = true;
+    old.save_connection(draft, Some("pw-demo".into()), None, None).await.unwrap();
+    drop(old);
+    *legacy.denied.lock().unwrap() = true;
+
+    let master: Arc<dyn crate::connections::secrets::SecretStore> = Arc::new(crate::connections::secrets::MemoryStore::default());
+    let vault = crate::connections::vault::VaultStore::new(crate::connections::vault::vault_path_for(&config), master, Some(legacy.clone()));
+    let services = AppServices::new(Arc::new(Service::new(config.clone(), Arc::new(vault))));
+    services.connections.secret_migration_failures().await.unwrap();
+
+    let mut model = WorkbenchModel::new(Shell::default());
+    let _ = model.dispatch("conn-refresh");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert_eq!(model.vault_alert.pending, Some(1));
+
+    // 全部迁入：用户拒绝授权。
+    let _ = model.dispatch("vault-migrate-all");
+    assert!(model.vault_alert.migrating_all && !model.vault_alert.dismissing);
+    // 全部迁入在途：重试与不再迁移都不派发。
+    let _ = model.dispatch("vault-retry-migration");
+    let _ = model.dispatch("vault-dismiss-legacy");
+    assert!(!model.vault_alert.retrying && !model.vault_alert.dismissing);
+    let token = model.begin_owner(&services.tasks, "vault");
+    let request = request_of(&mut model, token);
+    assert!(matches!(request.job, PendingJob::MigrateAllLegacy));
+    assert!(model.take_pending().is_none(), "忙碌时只排了一条");
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "vault", done);
+    assert_eq!(model.vault_alert.pending, Some(0), "失败的不算待迁入");
+    assert_eq!(model.vault_alert.failed.len(), 1);
+    assert!(model.vault_alert.shows_legacy_row(), "只剩失败条目时仍显示旧密码一行");
+    let line = super::chrome::legacy_pending_line(&model.vault_alert, |key| model.text(key));
+    assert!(line.contains('1') && !line.is_empty(), "{line}");
+    assert_eq!(line, crate::i18n::fill(&model.text("ui.settings.legacyFailed"), &[("n", "1")]));
+
+    // 不再迁移：自己的忙碌标记，不让“全部迁入”转圈；重试此时不可点。
+    let reads = legacy.reads.load(std::sync::atomic::Ordering::SeqCst);
+    let _ = model.dispatch("vault-dismiss-legacy");
+    assert!(model.vault_alert.dismissing && !model.vault_alert.migrating_all);
+    assert!(model.vault_alert.busy());
+    let _ = model.dispatch("vault-retry-migration");
+    let _ = model.dispatch("vault-migrate-all");
+    assert!(!model.vault_alert.retrying && !model.vault_alert.migrating_all);
+    let token = model.begin_owner(&services.tasks, "vault");
+    let request = request_of(&mut model, token);
+    assert!(matches!(request.job, PendingJob::DismissLegacy));
+    assert!(model.take_pending().is_none());
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "vault", done);
+    assert!(!model.vault_alert.dismissing);
+    assert!(model.vault_alert.failed.is_empty());
+    assert!(!model.vault_alert.shows_legacy_row());
+    assert!(!model.vault_alert.can_retry(), "不再提供逐条重试");
+    assert_eq!(model.notice_key, Some("ui.vault.legacyDismissed"));
+    assert_eq!(legacy.reads.load(std::sync::atomic::Ordering::SeqCst), reads, "不再迁移不读旧条目");
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 修订 6 复审：打开设置安全卡片且还不知道待迁入数量时，只排一次保险库加载：
+/// 主密钥读一次、旧条目一个不读，之后数量显示出来；再次打开不再加载。
+#[tokio::test]
+async fn opening_the_security_card_loads_the_vault_once_without_legacy_reads() {
+    let dir = std::env::temp_dir().join(format!("rillsql-vault-card-load-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("connections.sqlite");
+    let legacy = Arc::new(DenyingKeychain::default());
+    let old = AppServices::new(Arc::new(Service::new(config.clone(), legacy.clone())));
+    let mut draft = sample_draft(Engine::Mysql);
+    draft.save_password = true;
+    old.save_connection(draft, Some("pw-demo".into()), None, None).await.unwrap();
+    drop(old);
+    legacy.reads.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let master = Arc::new(DenyingKeychain::default());
+    let vault = crate::connections::vault::VaultStore::new(crate::connections::vault::vault_path_for(&config), master.clone(), Some(legacy.clone()));
+    let services = AppServices::new(Arc::new(Service::new(config.clone(), Arc::new(vault))));
+
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert_eq!(model.vault_alert.pending, None);
+    let _ = model.dispatch("settings");
+    assert!(model.take_pending().is_none(), "其他分区不加载保险库");
+    let _ = model.dispatch("settings-section-local");
+    assert_eq!(model.running_jobs, 0, "自动加载不算在途工作，不挡更新安装与关闭");
+    let token = model.begin_owner(&services.tasks, "vault-load");
+    let request = request_of(&mut model, token);
+    assert!(matches!(request.job, PendingJob::LoadVault));
+    assert!(model.take_pending().is_none(), "只排一次");
+    // 加载在途时反复切换分区也不重复排。
+    let _ = model.dispatch("settings-section-data");
+    let _ = model.dispatch("settings-section-local");
+    assert!(model.take_pending().is_none());
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "vault-load", done);
+    assert_eq!(master.reads.load(std::sync::atomic::Ordering::SeqCst), 1, "只读主密钥一次");
+    assert_eq!(legacy.reads.load(std::sync::atomic::Ordering::SeqCst), 0, "不读任何旧条目");
+    assert_eq!(model.vault_alert.pending, Some(1), "加载后数量显示出来");
+    assert!(model.vault_alert.shows_legacy_row());
+    assert!(model.vault_alert.load_problem.is_none());
+    // 已知数量后再打开卡片：不再加载。
+    let _ = model.dispatch("settings-section-data");
+    let _ = model.dispatch("settings-section-local");
+    assert!(model.take_pending().is_none());
+    assert_eq!(master.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 修订 6 复审：安全卡片触发的加载失败时（钥匙串拒绝给出主密钥），状态行显示既有的加载失败文字，
+/// 不显示旧密码一行，也不自动反复加载（由“重试”重新加载）。
+#[tokio::test]
+async fn a_failed_security_card_load_shows_the_load_problem() {
+    let dir = std::env::temp_dir().join(format!("rillsql-vault-card-fail-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("connections.sqlite");
+    let master = Arc::new(DenyingKeychain::default());
+    *master.denied.lock().unwrap() = true;
+    let legacy = Arc::new(DenyingKeychain::default());
+    let vault = crate::connections::vault::VaultStore::new(crate::connections::vault::vault_path_for(&config), master.clone(), Some(legacy.clone()));
+    let services = AppServices::new(Arc::new(Service::new(config.clone(), Arc::new(vault))));
+
+    let mut model = WorkbenchModel::new(Shell::default());
+    let _ = model.dispatch("settings");
+    let _ = model.dispatch("settings-section-local");
+    let token = model.begin_owner(&services.tasks, "vault-load");
+    let request = request_of(&mut model, token);
+    assert!(matches!(request.job, PendingJob::LoadVault));
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "vault-load", done);
+    assert_eq!(master.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(legacy.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let problem = model.vault_alert.load_problem.clone().expect("记下加载问题");
+    assert_eq!(problem.problem, crate::connections::secrets::VaultProblem::KeyUnavailable);
+    assert!(model.vault_alert.can_retry());
+    assert!(!model.vault_alert.shows_legacy_row());
+    let lines = super::chrome::vault_alert_lines(&model.vault_alert, |key| model.text(key));
+    let expected = crate::i18n::fill(&model.text("ui.vault.keyUnavailable"), &[("reason", "authorization denied")]);
+    assert!(lines.iter().any(|line| line == &expected), "{lines:?} vs {expected}");
+    let _ = model.dispatch("settings-section-data");
+    let _ = model.dispatch("settings-section-local");
+    assert!(model.take_pending().is_none(), "失败后不自动反复加载");
     drop(services);
     let _ = std::fs::remove_dir_all(dir);
 }
