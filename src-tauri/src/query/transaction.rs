@@ -83,6 +83,8 @@ pub(crate) struct StatementTrial {
     pub ambiguous_control: bool,
     /// 这一步之后不能再发送后续语句。
     pub stop: bool,
+    /// Only an ordinary SQL error on a usable session can be skipped.
+    pub recoverable_error: bool,
     /// 后续语句没有发送的原因。
     pub remaining: &'static str,
 }
@@ -233,6 +235,7 @@ impl StatementTrial {
             attempted: true,
             ambiguous_control: false,
             stop: status != "ok",
+            recoverable_error: false,
             remaining: "未执行",
         }
     }
@@ -253,6 +256,7 @@ fn refused(message: String) -> StatementTrial {
         attempted: false,
         ambiguous_control: false,
         stop: true,
+        recoverable_error: false,
         remaining: "未执行",
     }
 }
@@ -287,9 +291,13 @@ async fn run(
 
 /// 普通语句：成功/失败按方言登记，MySQL/MariaDB 的隐式提交单独报告（R9）。
 fn ordinary(transactions: Option<&TransactionCoordinator>, body: &str, ran: Ran) -> StatementTrial {
+    let confirmed_error = matches!(&ran.outcome, Err(StatementStop::Error { message, .. })
+        if super::exec::is_statement_timeout(message) || !super::exec::is_disconnect(message));
     let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional())
     else {
-        return StatementTrial::new(ran);
+        let mut trial = StatementTrial::new(ran);
+        trial.recoverable_error = confirmed_error && !super::split::is_transaction_control(body);
+        return trial;
     };
     let outcome = statement_outcome(transactions, &ran);
     let mut trial = StatementTrial::new(ran);
@@ -345,6 +353,9 @@ fn ordinary(transactions: Option<&TransactionCoordinator>, body: &str, ran: Ran)
         }
     }
     settle(&mut trial, transactions);
+    trial.recoverable_error = confirmed_error
+        && !matches!(outcome, StatementOutcome::Unconfirmed(_))
+        && transactions.state().is_some_and(TransactionState::allows_statements);
     trial
 }
 
@@ -419,6 +430,7 @@ fn acknowledge(
             attempted: false,
             ambiguous_control: false,
             stop: false,
+            recoverable_error: false,
             remaining: "未执行",
         },
     };

@@ -1,6 +1,7 @@
 //! GPUI 查询工作台。编辑器复用 SqlEditor，结果复用 DataTable。
 //! 方言规则在 query::assist / query::desk；这里只提交任务和显示。
 
+mod batch;
 mod log;
 mod plan_canvas;
 mod plan_view;
@@ -33,11 +34,12 @@ use crate::app::Density;
 use crate::application::AppServices;
 use crate::i18n::{self, Locale};
 use crate::query::assist::{self, LintFinding, RunScope, TreeObject};
-use crate::query::commands::RunDto;
+use crate::query::commands::{AWAITING_DECISION, BatchAnswer, BatchDecision, RunDto};
 use crate::query::desk::{self, BeginRun, Desk, DraftLink, DraftSync, ErrorMark, PreparedRun, ResultView, Target, Ticket};
 use crate::query::exec::AutoRewrite;
 
 pub use side::{SideMode, SideState};
+use batch::BatchControl;
 use crate::ui::{ObjectHandler, ObjectLink, SqlEditor};
 
 #[derive(Clone)]
@@ -125,6 +127,7 @@ pub struct QueryPane {
     editor_watch: HashMap<String, gpui_kit::Subscription>,
     /// 每个查询标签本次执行的开始时刻；执行中的结果头显示实时耗时。
     run_clock: HashMap<String, std::time::Instant>,
+    batch_controls: HashMap<String, BatchControl>,
     /// 每个查询标签最近一次执行携带的共享事务快照与效果（R3、R5、R9）。
     run_transactions: HashMap<String, crate::query::commands::TransactionReport>,
     /// 每个查询标签最近一次执行里每条语句的事务效果（StatementDto.transaction）。
@@ -523,10 +526,12 @@ async fn forward_run_snapshots(
 ) {
     let run_id = started.id.clone();
     let mut pending = desk::run_pending(&started.status);
+    let mut generation = 0;
     let _ = snapshots.send(Ok(started)).await;
     while pending {
-        match crate::query::commands::poll_run(query, &run_id, true).await {
-            Ok(snap) => {
+        match crate::query::commands::poll_snapshot(query, &run_id, true, Some(generation)).await {
+            Ok((next, snap)) => {
+                generation = next;
                 polls.fetch_add(1, Ordering::Relaxed);
                 pending = desk::run_pending(&snap.status);
                 let _ = snapshots.send(Ok(snap)).await;
@@ -667,6 +672,7 @@ impl QueryPane {
             editors: HashMap::new(),
             editor_watch: HashMap::new(),
             run_clock: HashMap::new(),
+            batch_controls: HashMap::new(),
             run_transactions: HashMap::new(),
             run_effects: HashMap::new(),
             tab_connections: HashMap::new(),
@@ -1001,9 +1007,8 @@ impl QueryPane {
         self.last_timeout
     }
 
-    #[cfg(test)]
     pub fn running(&self) -> bool {
-        self.desk.active_id().is_some_and(|id| self.desk.running_ids().iter().any(|running| running == id))
+        self.desk.active_running()
     }
 
     pub fn draft(&self) -> String {
@@ -1570,6 +1575,7 @@ impl QueryPane {
         self.editors.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.editor_watch.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.run_clock.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.batch_controls.retain(|id, control| self.desk.has_token(id, control.ticket.token));
         self.run_transactions.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.run_effects.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.tab_connections.retain(|id, _| ids.iter().any(|keep| keep == id));
@@ -1868,7 +1874,7 @@ impl QueryPane {
             return false;
         };
         let text = editor.read(cx).value(cx);
-        if self.desk.executed_sql(&id).as_deref() != Some(text.as_str()) {
+        if !self.desk.error_draft_matches(text.as_str()) {
             return false;
         }
         let Some(range) = error_ranges(&text, std::slice::from_ref(view)).into_iter().next() else {
@@ -1897,14 +1903,14 @@ impl QueryPane {
             return false;
         };
         let statement = (self.desk.result_view() == ResultView::Current)
-            .then(|| self.desk.results().iter().position(|item| item.status == view.status && item.sql == view.sql && item.message == view.message))
+            .then(|| self.desk.results().iter().position(|item| std::ptr::eq(item, view)))
             .flatten();
         // 先从借用的结果计算定位，只保留编辑器和范围；切换语句不需要复制结果行。
         let jump = (|| {
             let id = self.desk.active_id()?;
             let editor = self.editors.get(id)?.clone();
             let text = editor.read(cx).value(cx);
-            if self.desk.executed_sql(id).as_deref() != Some(text.as_str()) {
+            if !self.desk.error_draft_matches(text.as_str()) {
                 return None;
             }
             let range = error_ranges(&text, std::slice::from_ref(view)).into_iter().next()?;
@@ -1927,7 +1933,7 @@ impl QueryPane {
         let Some(id) = self.desk.active_id().map(str::to_owned) else {
             return;
         };
-        if self.desk.running_ids().iter().any(|running| running == &id) {
+        if self.running() && self.desk.status() != AWAITING_DECISION {
             return;
         }
         let generation = self.desk.view_gen();
@@ -1939,7 +1945,7 @@ impl QueryPane {
         };
         self.marks_seen.insert(id.clone(), generation);
         let text = editor.read(cx).value(cx);
-        if self.desk.executed_sql(&id).as_deref() != Some(text.as_str()) {
+        if !self.desk.error_draft_matches(text.as_str()) {
             return;
         }
         let errors = exec_errors(&text, self.desk.results());
@@ -1998,8 +2004,10 @@ impl QueryPane {
         // 一条执行只开一条有序快照通道：中间批次和终态按产生顺序送达界面。
         // 只等终态时，分批读取停在“加载更多”的等待上，界面永远停在“正在执行”且没有行。
         let (snapshots, mut received) = tokio::sync::mpsc::channel::<Result<RunDto, String>>(1);
+        let (answers, decisions) = tokio::sync::mpsc::unbounded_channel();
+        self.batch_controls.insert(ticket.tab_id.clone(), BatchControl { ticket: ticket.clone(), answers, answered: None });
         runtime().spawn(async move {
-            let started = match crate::query::commands::start_run(
+            let started = match crate::query::commands::start_workbench_run(
                 &services.connections,
                 &services.query,
                 crate::query::commands::StartRequest {
@@ -2011,6 +2019,7 @@ impl QueryPane {
                     limit: prepared.limit,
                     timeout_ms,
                 },
+                Some(decisions),
             )
             .await
             {
@@ -2059,7 +2068,7 @@ impl QueryPane {
                 let keep = view
                     .update(cx, |pane, cx| {
                         let running = !pane.desk.running_ids().is_empty();
-                        if running {
+                        if running && pane.running() && pane.desk.status() != AWAITING_DECISION {
                             cx.notify();
                         }
                         running
@@ -2083,6 +2092,18 @@ impl QueryPane {
 
     /// “正在执行 3.4 s”；还没有开始时刻（测试直接种入的运行态）时只写“正在执行”。
     fn running_text(&self) -> String {
+        if self.desk.status() == AWAITING_DECISION {
+            return i18n::text(self.locale, "query.batch.paused");
+        }
+        let results = self.desk.results();
+        if results.len() > 1 {
+            if let Some(index) = in_flight(results) {
+                return i18n::fill(&i18n::text(self.locale, "query.batch.running"), &[
+                    ("index", &(index + 1).to_string()), ("total", &results.len().to_string()),
+                    ("elapsed", &self.running_for().map(running_label).unwrap_or_default()),
+                ]);
+            }
+        }
         match self.running_for() {
             Some(elapsed) => i18n::fill(&i18n::text(self.locale, "query.status.runningFor"), &[("elapsed", &running_label(elapsed))]),
             None => i18n::text(self.locale, "query.status.running"),
@@ -2119,6 +2140,9 @@ impl QueryPane {
         };
         let cancel_text = i18n::text(self.locale, "query.run.cancel");
         self.desk.finish_polled(&self.services.tasks, ticket, result, &cancel_text);
+        if !pending && self.batch_controls.get(&ticket.tab_id).is_some_and(|control| control.ticket == *ticket) {
+            self.batch_controls.remove(&ticket.tab_id);
+        }
         match transaction {
             Some(report) => {
                 self.run_transactions.insert(ticket.tab_id.clone(), report);
@@ -2274,6 +2298,10 @@ impl QueryPane {
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
+        if let Some((ticket, index)) = self.batch_pause() {
+            self.answer_batch(&ticket, index, BatchDecision::Stop, cx);
+            return;
+        }
         let run_id = self.desk.cancel(&self.services.tasks);
         if let Some(run_id) = run_id {
             self.spawn_cancel(run_id, cx);
@@ -3422,7 +3450,7 @@ impl Render for QueryPane {
         let p = Palette::of(cx);
         let metrics = self.density.metrics();
         let mono = cx.theme().mono_font_family.clone();
-        let running = self.desk.active_id().is_some_and(|id| self.desk.running_ids().iter().any(|running| running == id));
+        let running = self.running();
         let entity = cx.entity();
 
         // 各区域在各自不内联的函数里搭建：未优化构建不复用栈槽，整页写在一个函数里时单帧近 800 KB，
@@ -3890,6 +3918,9 @@ impl QueryPane {
                 menu_entity.update(cx, |pane, _| pane.results_menu_requested = true);
             })
             .child(header);
+        if let Some(banner) = self.render_batch_banner(p, entity) {
+            results_panel = results_panel.child(banner);
+        }
         if let Some(row) = self.render_variables(p, metrics, entity, window, cx) {
             results_panel = results_panel.child(row);
         }
@@ -3932,8 +3963,10 @@ impl QueryPane {
     #[inline(never)]
     fn render_result_tabs(&mut self, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
         let locale = self.locale;
-        let running = self.desk.active_id().is_some_and(|id| self.desk.running_ids().iter().any(|item| item == id));
+        let running = self.running();
         let result_view = self.desk.result_view();
+        let current_statement = (running && self.desk.status() != AWAITING_DECISION)
+            .then(|| in_flight(self.desk.results())).flatten();
         let titles = self.desk.result_titles();
         let single = self.desk.results().len() <= 1;
         let mut items: Vec<AnyElement> = Vec::new();
@@ -3973,7 +4006,7 @@ impl QueryPane {
                     .unwrap_or_else(|| format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1));
                 // 跳过的语句没有结果可看：状态写进标题，不只靠颜色表达。
                 let label = if skipped { format!("{semantic} {}", i18n::text(locale, "query.log.skipped")) } else { semantic };
-                let dot = match statement_progress(self.desk.results(), index, running) {
+                let dot = match statement_progress(result, index, running, current_statement) {
                     Progress::Running => Some(p.accent),
                     Progress::Queued => Some(p.text_faint),
                     Progress::Done if statement_failed(result) => Some(p.danger),
@@ -4021,12 +4054,15 @@ impl QueryPane {
     #[inline(never)]
     fn render_collapsed_bar(&self, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
         let locale = self.locale;
-        let label = match self.desk.shown_result().filter(|result| !result.columns.is_empty()) {
-            Some(result) => i18n::fill(
+        let label = if self.desk.status() == AWAITING_DECISION {
+            i18n::text(locale, "query.batch.paused")
+        } else if let Some(result) = self.desk.shown_result().filter(|result| !result.columns.is_empty()) {
+            i18n::fill(
                 &i18n::text(locale, "query.results.collapsedBar"),
                 &[("count", &crate::app::views::grid::group_digits(result.rows.len() as i64))],
-            ),
-            None => i18n::text(locale, "query.results.collapsedEmpty"),
+            )
+        } else {
+            i18n::text(locale, "query.results.collapsedEmpty")
         };
         let open = entity.clone();
         let menu = entity.clone();
@@ -4124,7 +4160,7 @@ impl QueryPane {
         let failed_note = self.failure_view().is_some();
         // 耗时：执行中显示运行态，取消后显示已取消，完成后显示当前语句自己的耗时。
         let timing = self.result_timing();
-        if running {
+        if running && self.desk.status() != AWAITING_DECISION {
             items.push(
                 div()
                     .id("query-elapsed-running")
@@ -4411,6 +4447,10 @@ impl QueryPane {
         self.desk.tab_awaits_risk(tab_id)
     }
 
+    pub fn tab_awaits_batch_decision(&self, tab_id: &str) -> bool {
+        self.desk.tab_awaits_batch_decision(tab_id)
+    }
+
     /// 当前查询标签是否在等待风险确认（工具栏显示“等待确认…”）。
     pub fn awaiting_risk_confirmation(&self) -> bool {
         self.desk.pending_risks().is_some()
@@ -4462,7 +4502,7 @@ impl QueryPane {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         if self.desk.result_view() == ResultView::Messages {
             let log = self.desk.log();
-            let panel = log::LogPanel { entries: &log, batch: self.desk.log_batch(), locale, metrics, mono: mono.clone() };
+            let panel = log::LogPanel { entries: log, summary: self.batch_summary(), batch: self.desk.log_batch(), locale, metrics, mono: mono.clone() };
             #[cfg(test)]
             {
                 self.drawn_colors = Some((p.surface, p.chrome));
@@ -4517,7 +4557,9 @@ impl QueryPane {
         };
         if result.columns.is_empty() {
             let progress = if self.desk.result_view() == ResultView::Current {
-                statement_progress(self.desk.results(), self.desk.statement(), running)
+                let current = (running && self.desk.status() != AWAITING_DECISION)
+                    .then(|| in_flight(self.desk.results())).flatten();
+                statement_progress(result, self.desk.statement(), running, current)
             } else {
                 Progress::Done
             };
@@ -4757,17 +4799,17 @@ enum Progress {
     Queued,
 }
 
-fn statement_progress(results: &[desk::StatementView], index: usize, running: bool) -> Progress {
-    let Some(view) = results.get(index) else {
-        return Progress::Done;
-    };
-    if !running || !statement_pending(view) {
-        return Progress::Done;
-    }
-    if results.iter().position(statement_pending) == Some(index) {
+fn in_flight(results: &[desk::StatementView]) -> Option<usize> {
+    results.iter().position(|view| matches!(view.status.as_str(), "pending" | "running"))
+}
+
+fn statement_progress(view: &desk::StatementView, index: usize, running: bool, current: Option<usize>) -> Progress {
+    if running && current == Some(index) {
         Progress::Running
-    } else {
+    } else if running && statement_pending(view) {
         Progress::Queued
+    } else {
+        Progress::Done
     }
 }
 
@@ -5396,10 +5438,10 @@ mod tests {
     #[test]
     fn statement_progress_marks_only_the_first_unfinished_statement_as_running() {
         let results = vec![sheet("select 1", false, "running"), sheet("select pg_sleep(4)", false, "pending"), sheet("select 3", false, "pending")];
-        let progress = (0..3).map(|index| statement_progress(&results, index, true)).collect::<Vec<_>>();
-        assert_eq!(progress, vec![Progress::Done, Progress::Running, Progress::Queued]);
-        assert!((0..3).all(|index| statement_progress(&results, index, false) == Progress::Done));
-        assert_eq!(statement_progress(&results, 9, true), Progress::Done);
+        let progress = results.iter().enumerate().map(|(index, view)| statement_progress(view, index, true, in_flight(&results))).collect::<Vec<_>>();
+        assert_eq!(progress, vec![Progress::Running, Progress::Queued, Progress::Queued]);
+        assert_eq!(statement_progress(&results[1], 1, true, None), Progress::Queued);
+        assert_eq!(statement_progress(&results[1], 1, false, None), Progress::Done);
     }
 
     #[test]
@@ -5747,6 +5789,79 @@ mod tests {
             database: Some("main".to_owned()),
             engine: Some("sqlite".to_owned()),
         }
+    }
+
+    #[gpui_kit::test]
+    fn batch_error_choices_continue_the_original_sql_or_mark_the_tail_skipped(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-batch-{}", uuid::Uuid::new_v4()));
+        let (window, pane) = open_in(cx, &dir, 640., 720.);
+        let database = dir.join("batch.sqlite");
+        let fixture = runtime().block_on(async {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true)).await.unwrap();
+            sqlx::query("CREATE TABLE visits (n INTEGER)").execute(&pool).await.unwrap();
+            pool
+        });
+        let services = cx.update(|cx| Arc::clone(&pane.read(cx).services));
+        runtime().block_on(services.connections.open_sqlite_for_test("notes", "Notes", &database)).unwrap();
+        let sql = "INSERT INTO visits VALUES (1); SELECT missing_a; SELECT missing_b; SELECT missing_c; SELECT COUNT(*) FROM visits";
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.sync(&[bound("q", sql)], Some("q"), Locale::En, window, cx);
+            });
+        }).unwrap();
+        for stop in [false, true] {
+            cx.update_window(window, |_, _, cx| pane.update(cx, |pane, cx| pane.command("run-script", cx))).unwrap();
+            let wait_at = |cx: &mut TestAppContext, index: usize| {
+                assert!(wait_for_tokio(cx, window, Duration::from_secs(15), |cx| {
+                    cx.update(|cx| pane.read(cx).batch_pause().is_some_and(|(_, at)| at == index))
+                }), "did not pause at {index}");
+            };
+            wait_at(cx, 1);
+            cx.update_window(window, |_, window, cx| {
+                let results = pane.read(cx).desk.results();
+                assert_eq!(results[0].affected, Some(1));
+                assert_eq!(results[1].status, "error");
+                assert!(results[2..].iter().all(|r| r.status == "pending"));
+                assert_eq!(pane.read(cx).desk.statement(), 1);
+                for id in ["query-batch-continue", "query-batch-all", "query-batch-stop"] {
+                    let button = window.find(id);
+                    assert!(button.visible());
+                    let bounds = button.bounds();
+                    assert!(bounds.origin.x >= px(0.) && bounds.right() <= window.viewport_size().width);
+                }
+                window.click(if stop { "query-batch-stop" } else { "query-batch-continue" }, cx);
+            }).unwrap();
+            if !stop {
+                wait_at(cx, 2);
+                cx.update_window(window, |_, window, cx| window.click("query-batch-all", cx)).unwrap();
+            }
+            assert!(wait_for_tokio(cx, window, Duration::from_secs(15), |cx| cx.update(|cx| !pane.read(cx).running())));
+            cx.update(|cx| {
+                let pane = pane.read(cx);
+                assert_eq!(pane.desk.status(), "error");
+                let results = pane.desk.results();
+                if stop {
+                    assert!(results[2..].iter().all(|r| r.status == "skipped"));
+                    assert_eq!(pane.batch_summary().as_deref(), Some("1 succeeded · 1 failed · 3 skipped"));
+                } else {
+                    assert_eq!(results[4].rows[0][0].as_deref(), Some("1"));
+                    assert_eq!(pane.batch_summary().as_deref(), Some("2 succeeded · 3 failed · 0 skipped"));
+                }
+            });
+        }
+        cx.update_window(window, |_, _, cx| pane.update(cx, |pane, cx| pane.command("run-script", cx))).unwrap();
+        assert!(wait_for_tokio(cx, window, Duration::from_secs(15), |cx| cx.update(|cx| pane.read(cx).batch_pause().is_some())));
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| { pane.sync(&[], None, Locale::En, window, cx); });
+        }).unwrap();
+        assert!(wait_for_tokio(cx, window, Duration::from_secs(15), |_| services.query.retained_run_count() == 0));
+        let writes: i64 = runtime().block_on(sqlx::query_scalar("SELECT COUNT(*) FROM visits").fetch_one(&fixture)).unwrap();
+        assert_eq!(writes, 3, "each batch sends its initial write exactly once");
+        runtime().block_on(fixture.close());
+        services.connections.disconnect("notes");
     }
 
     /// R12：危险语句进入模态确认；期间工具栏显示“等待确认…”；20 条语句时按钮固定在可见区；

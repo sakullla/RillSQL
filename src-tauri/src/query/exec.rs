@@ -299,6 +299,8 @@ impl DriverReport {
 
 #[async_trait::async_trait]
 pub trait StatementDriver: Send + Sync {
+    fn set_statement_index(&self, _index: usize) {}
+
     async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> DriverReport;
 
     /// 方言的事务状态探针。它不是用户语句：不占语句序号，也不向结果区发布行。
@@ -323,6 +325,24 @@ pub async fn run_batch(
     via_ssh: bool,
     driver: &dyn StatementDriver,
     transactions: Option<&TransactionCoordinator>,
+) -> BatchReport {
+    run_batch_observed(parts, limit, cancel_flag, via_ssh, driver, transactions, None).await
+}
+
+#[async_trait::async_trait]
+pub(crate) trait BatchObserver: Send {
+    /// Publish the completed statement. Only a recoverable error can be continued.
+    async fn finished(&mut self, index: usize, report: &StatementReport, recoverable: bool) -> bool;
+}
+
+pub(crate) async fn run_batch_observed(
+    parts: &[Piece],
+    limit: usize,
+    cancel_flag: &Arc<AtomicBool>,
+    via_ssh: bool,
+    driver: &dyn StatementDriver,
+    transactions: Option<&TransactionCoordinator>,
+    mut observer: Option<&mut dyn BatchObserver>,
 ) -> BatchReport {
     let mut statements = Vec::new();
     let mut calls = 0usize;
@@ -354,6 +374,7 @@ pub async fn run_batch(
             break;
         }
         let plan = super::transaction::plan(transactions, &piece.text);
+        driver.set_statement_index(index);
         let trial = super::transaction::attempt(transactions, plan, driver, limit, cancel_flag, &piece.text).await;
         if trial.attempted {
             calls += 1;
@@ -365,7 +386,16 @@ pub async fn run_batch(
         let statement_status = trial.status;
         let (stop, remaining) = (trial.stop, trial.remaining);
         defer_reconcile |= trial.ambiguous_control;
-        statements.push(statement_report(piece.text.clone(), trial));
+        let recoverable = trial.recoverable_error
+            && index + 1 < parts.len()
+            && !cancel_flag.load(Ordering::SeqCst);
+        let report = statement_report(piece.text.clone(), trial);
+        let resume = if let Some(observer) = observer.as_deref_mut() {
+            observer.finished(index, &report, recoverable).await && recoverable
+        } else {
+            false
+        };
+        statements.push(report);
         // 取消不等于回滚：事务效果已按方言登记，这里只收尾取消状态与未执行语句（R8）。
         if statement_status == "cancelled" {
             cancel::on_statement_end(&mut cancel, "cancelled");
@@ -375,7 +405,7 @@ pub async fn run_batch(
                 cancel.message = "数据库已确认取消。".to_owned();
             }
         }
-        if stop {
+        if stop && !resume {
             for rest in &parts[index + 1..] {
                 statements.push(skipped(rest.text.clone(), remaining));
             }
@@ -396,7 +426,7 @@ pub async fn run_batch(
             break;
         }
     }
-    if statements.is_empty() {
+    if status == "done" && (statements.is_empty() || statements.iter().any(|statement| statement.status == "error")) {
         status = "error";
     }
     // 这一批留下了未知或层数不明时再核对一次：能确认的立即显示真实状态，不把猜测留给界面。
@@ -683,8 +713,12 @@ impl LiveDriver {
 
 #[async_trait::async_trait]
 impl StatementDriver for LiveDriver {
+    fn set_statement_index(&self, index: usize) {
+        self.statement_index.store(index, Ordering::Relaxed);
+    }
+
     async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> DriverReport {
-        let index = self.statement_index.fetch_add(1, Ordering::SeqCst);
+        let index = self.statement_index.load(Ordering::Relaxed);
         let mut attached = self.session.lock().await;
         // 没有可查询的会话时一条语句都不会发出去：报告里也就不能带改写后的文本，
         // 否则界面会给一条从未执行的语句显示"实际执行的语句"和追加的 LIMIT。

@@ -418,6 +418,40 @@ fn scripted(steps: Vec<Result<StatementValue, StatementStop>>) -> Scripted {
 }
 
 #[tokio::test]
+async fn batch_continuation_never_replays_a_write_or_overrides_a_hard_stop() {
+    use crate::connections::model::Engine;
+    struct Continue(Vec<usize>);
+    #[async_trait::async_trait]
+    impl exec::BatchObserver for Continue {
+        async fn finished(&mut self, index: usize, _: &exec::StatementReport, recoverable: bool) -> bool {
+            if recoverable {
+                self.0.push(index);
+            }
+            true
+        }
+    }
+    let missing = || StatementStop::Error { message: "relation missing does not exist".into(), at: None, code: Some("42P01".into()) };
+    for (prefix, failure, expected, can_continue) in [
+        ("INSERT INTO item VALUES (1)", missing(), "error", true),
+        ("BEGIN", missing(), "error", false),
+        ("INSERT INTO item VALUES (1)", StatementStop::Unknown { message: "connection reset".into() }, "unknown", false),
+        ("SELECT 1", StatementStop::Cancelled { message: "cancelled".into() }, "cancelled", false),
+    ] {
+        let transactions = coordinator(Engine::Postgres);
+        let driver = scripted(vec![Ok(ok_count()), Err(failure), Ok(ok_count())]);
+        let parts = [piece(prefix), piece("UPDATE missing SET n = 1"), piece("SELECT 2")];
+        let mut observer = Continue(Vec::new());
+        let report = exec::run_batch_observed(&parts, 10, &Arc::new(AtomicBool::new(false)), false, &driver, Some(&transactions), Some(&mut observer)).await;
+        assert_eq!(report.status, expected);
+        assert_eq!(report.statements[2].status, if can_continue { "ok" } else { "skipped" });
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls.len(), if can_continue { 3 } else { 2 });
+        assert_eq!(calls.iter().filter(|sql| *sql == prefix).count(), 1);
+        assert_eq!(observer.0, if can_continue { vec![1] } else { vec![] });
+    }
+}
+
+#[tokio::test]
 async fn handwritten_controls_share_the_connection_transaction() {
     use crate::connections::model::Engine;
     use crate::transaction::{TransactionEffect, TransactionState};

@@ -2249,6 +2249,14 @@ dict! {
     "query.status.queued" => "等待执行", "Waiting to run";
     "query.empty.runCurrent" => "只运行光标所在语句", "Run only the statement at the cursor";
     "query.status.runningFor" => "正在执行 {elapsed}", "Running {elapsed}";
+    "query.batch.running" => "执行 {index}/{total} · {elapsed}", "Running {index}/{total} · {elapsed}";
+    "query.batch.paused" => "批次已暂停，等待选择", "Batch paused · decision needed";
+    "query.batch.failure" => "第 {index}/{total} 条失败，剩余 {left} 条", "Statement {index}/{total} failed · {left} remaining";
+    "query.batch.continue" => "跳过并继续", "Skip and continue";
+    "query.batch.continueAll" => "后续错误也跳过", "Skip future errors";
+    "query.batch.allHint" => "继续本批，遇到可跳过的错误时自动执行下一条", "Continue this batch automatically after recoverable errors";
+    "query.batch.stop" => "结束本批", "End batch";
+    "query.batch.summary" => "{ok} 条成功 · {failed} 条失败 · {skipped} 条未执行", "{ok} succeeded · {failed} failed · {skipped} skipped";
     "query.empty.run" => "运行选中内容或光标所在语句", "Run the selection or the statement at the cursor";
     "query.empty.runAll" => "运行全部语句", "Run every statement";
     "structure.action.refresh" => "刷新结构", "Refresh structure";

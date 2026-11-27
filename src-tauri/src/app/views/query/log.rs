@@ -62,6 +62,7 @@ pub fn entry_text(locale: Locale, entry: &LogEntry) -> String {
 
 pub struct LogPanel<'a> {
     pub entries: &'a [LogEntry],
+    pub summary: Option<String>,
     pub batch: u64,
     pub locale: Locale,
     pub metrics: Metrics,
@@ -71,7 +72,9 @@ pub struct LogPanel<'a> {
 impl LogPanel<'_> {
     pub fn render(self, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
         let locale = self.locale;
-        let heading = if self.batch == 0 {
+        let heading = if let Some(summary) = self.summary {
+            summary
+        } else if self.batch == 0 {
             i18n::text(locale, "query.log.tab")
         } else {
             i18n::fill(

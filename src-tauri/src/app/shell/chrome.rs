@@ -2906,7 +2906,14 @@ impl Workbench {
                 _ => (tab.uncommitted_cells, Some(dirty_table_text.clone())),
             };
             // 等待风险确认的查询标签：沿用脏标记的位置，提示文字说明还在等确认（切走后也看得到）。
-            let (dirty, dirty_tip) = if self.tab_awaits_risk(&tab, cx) { (true, Some(awaiting_text.clone())) } else { (dirty, dirty_tip) };
+            let paused = tab.running && tab.kind.is_query() && self.query.read(cx).tab_awaits_batch_decision(&tab.id);
+            let (dirty, dirty_tip) = if paused {
+                (true, Some(self.t("query.batch.paused")))
+            } else if self.tab_awaits_risk(&tab, cx) {
+                (true, Some(awaiting_text.clone()))
+            } else {
+                (dirty, dirty_tip)
+            };
             let title = SharedString::from(tab.title.clone());
             let (is_prod, context_hint) = tab
                 .connection_id
@@ -2947,12 +2954,13 @@ impl Workbench {
             let preview = self.model.is_preview_tab(&tab.id);
             let close_label = self.t("common.close");
             // 运行中的转圈是独立小实体：动画帧不通知工作台，不触发工作台的整理。
-            let spinner = tab.running.then(|| self.spinners.view(format!("tab-{id}"), Size::XSmall, Some(p.accent), cx));
+            let running = tab.running && !paused;
+            let spinner = running.then(|| self.spinners.view(format!("tab-{id}"), Size::XSmall, Some(p.accent), cx));
             let chip = tabs::tab(
                 tabs::TabSpec::new(SharedString::from(format!("tab-{id}")), item_icon(tab.kind), title)
                     .workspace()
                     .active(active)
-                    .running(tab.running)
+                    .running(running)
                     .spinner(spinner)
                     .pinned(tab.pinned.then(|| pinned_text.clone()))
                     .prod(is_prod)

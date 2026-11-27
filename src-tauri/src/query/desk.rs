@@ -153,21 +153,21 @@ pub enum ResultView {
 
 /// 一批最终结果对应的消息记录。
 pub fn log_entries(results: &[StatementView]) -> Vec<LogEntry> {
-    results
-        .iter()
-        .enumerate()
-        .map(|(index, view)| LogEntry {
-            statement: Some(index),
-            sql: view.sql.clone(),
-            sent_sql: view.sent_sql.clone(),
-            rewrite: view.rewrite.clone(),
-            status: view.status.clone(),
-            rows: (!view.columns.is_empty()).then_some(view.rows.len()),
-            affected: view.affected,
-            elapsed_ms: view.elapsed_ms,
-            message: view.message.clone(),
-        })
-        .collect()
+    results.iter().enumerate().map(statement_log).collect()
+}
+
+fn statement_log((index, view): (usize, &StatementView)) -> LogEntry {
+    LogEntry {
+        statement: Some(index),
+        sql: view.sql.clone(),
+        sent_sql: view.sent_sql.clone(),
+        rewrite: view.rewrite.clone(),
+        status: view.status.clone(),
+        rows: (!view.columns.is_empty()).then_some(view.rows.len()),
+        affected: view.affected,
+        elapsed_ms: view.elapsed_ms,
+        message: view.message.clone(),
+    }
 }
 
 /// 发起执行时这批 SQL 在草稿里的位置：from 是 pick 在草稿里的起点，sql 是实际送出的文本。
@@ -216,6 +216,7 @@ struct TabState {
     executed: bool,
     /// 最近一次成功送达的 SQL。关闭守卫据此判断草稿是否“已执行”。
     executed_sql: Option<String>,
+    running_draft: Option<String>,
     token: Option<TaskToken>,
     run_id: Option<String>,
     results: Vec<StatementView>,
@@ -370,6 +371,10 @@ impl Desk {
         self.tabs.iter().filter(|tab| tab.running).map(|tab| tab.id.clone()).collect()
     }
 
+    pub fn active_running(&self) -> bool {
+        self.active_tab().is_some_and(|tab| tab.running)
+    }
+
     /// 只读展示借用当前结果，刷新标题和状态时不复制整份单元格数据。
     pub fn results(&self) -> &[StatementView] {
         self.active_tab().map(|tab| tab.results.as_slice()).unwrap_or_default()
@@ -420,6 +425,10 @@ impl Desk {
     /// 某个标签是否在等待风险确认（不论是否为当前标签）：标签栏与标签列表据此标出。
     pub fn tab_awaits_risk(&self, id: &str) -> bool {
         self.tabs.iter().any(|tab| tab.id == id && tab.pending_risk.is_some())
+    }
+
+    pub fn tab_awaits_batch_decision(&self, id: &str) -> bool {
+        self.tabs.iter().any(|tab| tab.id == id && tab.status == commands::AWAITING_DECISION)
     }
 
     pub fn has_tab(&self, id: &str) -> bool {
@@ -487,6 +496,7 @@ impl Desk {
             cancelled: false,
             executed: false,
             executed_sql: None,
+            running_draft: None,
             token: None,
             run_id: None,
             results: Vec::new(),
@@ -571,6 +581,17 @@ impl Desk {
 
     pub fn executed_sql(&self, id: &str) -> Option<String> {
         self.tabs.iter().find(|tab| tab.id == id).and_then(|tab| tab.executed_sql.clone())
+    }
+
+    pub fn error_draft_matches(&self, text: &str) -> bool {
+        self.active_tab().is_some_and(|tab| {
+            let source = if tab.status == commands::AWAITING_DECISION && !matches!(tab.result_view, ResultView::Pinned(_)) {
+                &tab.running_draft
+            } else {
+                &tab.executed_sql
+            };
+            source.as_deref() == Some(text)
+        })
     }
 
     pub fn tab_draft(&self, id: &str) -> Option<String> {
@@ -785,8 +806,8 @@ impl Desk {
     }
 
     /// 活动标签最近一次执行的消息记录。
-    pub fn log(&self) -> Vec<LogEntry> {
-        self.active_tab().map(|tab| tab.log.clone()).unwrap_or_default()
+    pub fn log(&self) -> &[LogEntry] {
+        self.active_tab().map(|tab| tab.log.as_slice()).unwrap_or_default()
     }
 
     /// 消息记录是第几次执行的；从未执行过为 0。
@@ -1302,12 +1323,24 @@ impl Desk {
                     tab.results_target = tab.run_target.clone();
                     tab.results_fresh = true;
                     tab.run_id = Some(run.id);
+                    if run.status == commands::AWAITING_DECISION {
+                        if let Some(failed) = tab.results.iter().rposition(|view| view.status == "error") {
+                            tab.statement = failed;
+                        }
+                    }
                     if !pending {
                         tab.executed = true;
-                        tab.executed_sql = Some(tab.draft.clone());
-                        tab.statement = 0;
+                        tab.executed_sql = tab.running_draft.take();
+                        tab.statement = tab.results.iter().enumerate()
+                            .filter(|(_, view)| view.result_set.is_none_or(|(at, _)| at == 0))
+                            .nth(tab.statement).map_or(0, |(index, _)| index);
                         tab.run_seq = tab.run_seq.saturating_add(1);
                         tab.log = log_entries(&tab.results);
+                    } else if tab.results.len() > 1 {
+                        let next = tab.log.len();
+                        let finished = tab.results.iter().enumerate().skip(next)
+                            .take_while(|(_, view)| !matches!(view.status.as_str(), "pending" | "running"));
+                        tab.log.extend(finished.map(statement_log));
                     }
                     true
                 }
@@ -1418,12 +1451,13 @@ impl Desk {
         let origin = run_origin(tab, &pick, override_sql.is_some(), &target.engine);
         if let Some(tab) = self.active_mut() {
             tab.running = true;
+            tab.statement = 0;
             tab.cancelled = false;
             tab.token = Some(token);
             tab.status = "running".to_owned();
             tab.pending = None;
             tab.pending_risk = None;
-            tab.draft = original;
+            tab.running_draft = Some(original);
             tab.run_origin = Some(origin);
             tab.run_target = Some(target.clone());
             tab.results_fresh = false;
@@ -1820,6 +1854,7 @@ impl Desk {
             cancelled: false,
             executed: false,
             executed_sql: None,
+            running_draft: None,
             token: None,
             run_id: None,
             results: Vec::new(),
@@ -2169,7 +2204,7 @@ fn sqlite_column_meta(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<C
 /// 快照是否还表示执行中。只有 running / cancel-requested 会继续等下一批行，
 /// 其余状态都是终态（完成、失败、取消、结果未知）。
 pub fn run_pending(status: &str) -> bool {
-    matches!(status, "running" | "cancel-requested")
+    matches!(status, "running" | "cancel-requested" | commands::AWAITING_DECISION)
 }
 
 fn statement_view(statement: commands::StatementDto) -> StatementView {

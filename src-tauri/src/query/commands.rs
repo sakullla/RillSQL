@@ -30,7 +30,19 @@ struct RunSlot {
     cancel_flag: Arc<AtomicBool>,
     started: Instant,
     pace: Arc<exec::Pace>,
+    stop_prompt: tokio::sync::Notify,
 }
+
+pub(crate) const AWAITING_DECISION: &str = "awaiting-decision";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchDecision {
+    Continue,
+    ContinueAll,
+    Stop,
+}
+
+pub(crate) type BatchAnswer = (usize, BatchDecision);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,6 +171,15 @@ impl Drop for Reservation {
 }
 
 pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: StartRequest) -> Result<RunDto, String> {
+    start_workbench_run(service, state, request, None).await
+}
+
+pub(crate) async fn start_workbench_run(
+    service: &Arc<Service>,
+    state: &QueryState,
+    request: StartRequest,
+    answers: Option<tokio::sync::mpsc::UnboundedReceiver<BatchAnswer>>,
+) -> Result<RunDto, String> {
     let report = split_sql(&request.engine, &request.sql);
     if let Some(reason) = report.refusal {
         return Err(reason);
@@ -176,7 +197,6 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     let id = uuid::Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
     let cancel_flag = transport.sqlite_flag().unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-    cancel_flag.store(false, Ordering::SeqCst);
     let statements = parts
         .iter()
         .map(|piece| StatementDto {
@@ -221,6 +241,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     };
     // 任何 await 之前占住这条连接，失败时由 Reservation 撤掉占位。
     let mut reservation = reserve_run(state, snapshot.clone(), Arc::clone(&cancel_flag))?;
+    cancel_flag.store(false, Ordering::SeqCst);
     let query = service.query_session(&request.connection_id).await?.ok_or_else(|| {
         // lost 状态明确拒绝新执行：结果未知的写语句不会被静默排队重放（R4）。
         if matches!(service.session_condition(&request.connection_id), Some(SessionCondition::Lost { .. })) {
@@ -263,7 +284,14 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
         // 批次从 attach 到复位一直持有业务执行租约：同连接的其他业务执行必须等待（ADR-1）。
         let _lease = lease;
         let _finish_pace = FinishPace(Arc::clone(&pace));
-        let batch = exec::run_batch(&parts, limit, &cancel_flag, via_ssh, &driver, transaction.as_deref()).await;
+        let interactive = parts.len() > 1
+            && crate::adapters::query::workbench_named(&request.engine) == Some(crate::adapters::Workbench::Relational);
+        let batch = if let Some(answers) = answers.filter(|_| interactive) {
+            let mut observer = InteractiveBatch { slot: &slot, answers, continue_all: false };
+            exec::run_batch_observed(&parts, limit, &cancel_flag, via_ssh, &driver, transaction.as_deref(), Some(&mut observer)).await
+        } else {
+            exec::run_batch(&parts, limit, &cancel_flag, via_ssh, &driver, transaction.as_deref()).await
+        };
         // 整批结束后在业务会话上把语句超时设置复位，不泄漏到这一批之外。
         let _ = driver.finish().await;
         let summary = summary_of(&batch);
@@ -289,6 +317,7 @@ fn reserve_run(state: &QueryState, snapshot: RunDto, cancel_flag: Arc<AtomicBool
         cancel_flag,
         started: Instant::now(),
         pace: Arc::new(exec::Pace::new()),
+        stop_prompt: tokio::sync::Notify::new(),
     });
     runs.insert(id.clone(), Arc::clone(&slot));
     Ok(Reservation {
@@ -313,22 +342,22 @@ fn finish_run(slot: &RunSlot, batch: exec::BatchReport, notices: &[String]) {
         snapshot,
         effect: batch.transaction_effect,
     });
-    let mut statements = batch.statements.into_iter().flat_map(statement_dtos).collect::<Vec<_>>();
+    let mut statements = Vec::new();
+    for (report, previous) in batch.statements.into_iter().zip(&mut snap.statements) {
+        let mut pages = statement_dtos(report);
+        let first = &mut pages[0];
+        if first.rows.is_empty() && !previous.rows.is_empty() && matches!(first.status.as_str(), "cancelled" | "error" | "unknown") {
+            first.columns = std::mem::take(&mut previous.columns);
+            first.column_types = std::mem::take(&mut previous.column_types);
+            first.rows = std::mem::take(&mut previous.rows);
+            first.truncated = previous.truncated;
+        }
+        statements.extend(pages);
+    }
     if let Some(first) = statements.first_mut() {
         if !notices.is_empty() {
             let note = notices.join("");
             first.message = if first.message.is_empty() { note } else { format!("{note}{}", first.message) };
-        }
-    }
-    for (next, previous) in statements.iter_mut().zip(snap.statements.iter_mut()) {
-        let keep = next.rows.is_empty()
-            && !previous.rows.is_empty()
-            && matches!(next.status.as_str(), "cancelled" | "error" | "unknown");
-        if keep {
-            next.columns = std::mem::take(&mut previous.columns);
-            next.column_types = std::mem::take(&mut previous.column_types);
-            next.rows = std::mem::take(&mut previous.rows);
-            next.truncated = previous.truncated;
         }
     }
     snap.statements = statements;
@@ -450,6 +479,67 @@ fn statement_dto(statement: StatementReport) -> StatementDto {
 
 struct SlotSink {
     slot: Arc<RunSlot>,
+}
+
+struct InteractiveBatch<'a> {
+    slot: &'a RunSlot,
+    answers: tokio::sync::mpsc::UnboundedReceiver<BatchAnswer>,
+    continue_all: bool,
+}
+
+#[async_trait::async_trait]
+impl exec::BatchObserver for InteractiveBatch<'_> {
+    async fn finished(&mut self, index: usize, report: &StatementReport, recoverable: bool) -> bool {
+        let can_resume = {
+            let mut snap = self.slot.snapshot.lock().expect("snapshot");
+            let can_resume = recoverable && snap.status == "running" && !self.answers.is_closed();
+            let statement = &mut snap.statements[index];
+            statement.status = report.status.to_owned();
+            statement.message.clone_from(&report.message);
+            statement.elapsed_ms = report.elapsed_ms;
+            statement.transaction = report.transaction;
+            statement.error_at = report.error_at;
+            statement.error_code.clone_from(&report.error_code);
+            statement.rewrite.clone_from(&report.rewrite);
+            statement.sent_sql = (report.sent_sql != report.sql && !report.sent_sql.is_empty()).then(|| report.sent_sql.clone());
+            statement.affected = report.affected;
+            if !report.columns.is_empty() {
+                statement.columns.clone_from(&report.columns);
+                statement.column_types.clone_from(&report.column_types);
+                if statement.rows.len() < report.rows.len() {
+                    statement.rows.extend_from_slice(&report.rows[statement.rows.len()..]);
+                }
+                statement.truncated = report.truncated;
+            }
+            if can_resume && !self.continue_all {
+                snap.status = AWAITING_DECISION.to_owned();
+            }
+            can_resume
+        };
+        self.slot.pace.bump();
+        if !can_resume || self.continue_all {
+            return can_resume;
+        }
+        loop {
+            let answer = tokio::select! {
+                biased;
+                _ = self.slot.stop_prompt.notified() => None,
+                answer = self.answers.recv() => answer,
+            };
+            let Some((at, decision)) = answer else { return false };
+            if at != index {
+                continue;
+            }
+            let mut snap = self.slot.snapshot.lock().expect("snapshot");
+            if decision == BatchDecision::Stop || snap.status != AWAITING_DECISION {
+                return false;
+            }
+            self.continue_all = decision == BatchDecision::ContinueAll;
+            snap.status = "running".to_owned();
+            self.slot.pace.bump();
+            return true;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -617,7 +707,7 @@ fn connection_busy(state: &QueryState, connection_id: &str) -> bool {
 
 fn slot_busy(slot: &RunSlot, connection_id: &str) -> bool {
     let snap = slot.snapshot.lock().expect("snapshot");
-    snap.connection_id == connection_id && matches!(snap.status.as_str(), "running" | "cancel-requested")
+    snap.connection_id == connection_id && super::desk::run_pending(&snap.status)
 }
 
 pub async fn request_cancel(service: &Arc<Service>, state: &QueryState, run_id: &str) -> Result<RunDto, String> {
@@ -629,14 +719,19 @@ pub async fn request_cancel(service: &Arc<Service>, state: &QueryState, run_id: 
         .cloned()
         .ok_or_else(|| "找不到这次执行".to_owned())?;
     let connection_id = slot.snapshot.lock().expect("snapshot").connection_id.clone();
-    let status = slot.snapshot.lock().expect("snapshot").status.clone();
-    if !matches!(status.as_str(), "running" | "cancel-requested") {
-        return Ok(slot.snapshot.lock().expect("snapshot").clone());
-    }
     let transport = service.cancel_transport(&connection_id).unwrap_or_default();
     let via_ssh = transport.via_ssh();
     {
         let mut snap = slot.snapshot.lock().expect("snapshot");
+        if snap.status == AWAITING_DECISION {
+            snap.status = "cancel-requested".to_owned();
+            slot.cancel_flag.store(true, Ordering::SeqCst);
+            slot.stop_prompt.notify_one();
+            return Ok(snap.clone());
+        }
+        if !super::desk::run_pending(&snap.status) {
+            return Ok(snap.clone());
+        }
         let requested = cancel::on_request(via_ssh);
         snap.status = "cancel-requested".to_owned();
         snap.cancel = requested.phase.to_owned();
@@ -662,6 +757,14 @@ pub async fn request_cancel(service: &Arc<Service>, state: &QueryState, run_id: 
 }
 
 pub async fn poll_run(state: &QueryState, run_id: &str, continue_read: bool) -> Result<RunDto, String> {
+    poll_snapshot(state, run_id, continue_read, None).await.map(|(_, snap)| snap)
+}
+
+/// The workbench remembers the last generation it received. A failure can arrive
+/// before its first poll and then remain paused indefinitely.
+pub(crate) async fn poll_snapshot(
+    state: &QueryState, run_id: &str, continue_read: bool, seen: Option<u64>,
+) -> Result<(u64, RunDto), String> {
     let slot = state
         .runs
         .lock()
@@ -669,23 +772,25 @@ pub async fn poll_run(state: &QueryState, run_id: &str, continue_read: bool) -> 
         .get(run_id)
         .cloned()
         .ok_or_else(|| "找不到这次执行".to_owned())?;
-    if continue_read && matches!(slot.snapshot.lock().expect("snapshot").status.as_str(), "running" | "cancel-requested") {
-        let before = slot.pace.generation();
+    let before = seen.unwrap_or_else(|| slot.pace.generation());
+    let pending = super::desk::run_pending(&slot.snapshot.lock().expect("snapshot").status);
+    if continue_read && pending {
         slot.pace.request();
         slot.pace.wait_changed(before).await;
     }
+    let generation = slot.pace.generation();
     let mut snap = slot.snapshot.lock().expect("snapshot").clone();
     if matches!(snap.status.as_str(), "running" | "cancel-requested") {
         snap.elapsed_ms = u64::try_from(slot.started.elapsed().as_millis()).unwrap_or(u64::MAX);
     }
-    Ok(snap)
+    Ok((generation, snap))
 }
 
 /// 前端已收到最终快照后释放后端副本；执行中和等待读取的运行仍由原生命周期持有。
 pub fn release_run(state: &QueryState, run_id: &str) -> bool {
     let mut runs = state.runs.lock().expect("runs");
     let finished = runs.get(run_id).is_some_and(|slot| {
-        !matches!(slot.snapshot.lock().expect("snapshot").status.as_str(), "running" | "cancel-requested")
+        !super::desk::run_pending(&slot.snapshot.lock().expect("snapshot").status)
     });
     if finished {
         runs.remove(run_id);
